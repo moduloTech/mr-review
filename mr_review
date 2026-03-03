@@ -10,16 +10,16 @@
 # and approves or requests changes accordingly.
 #
 # Usage:
-#   ruby mr_reviewer.rb <MR_URL>
-#   ruby mr_reviewer.rb <PROJECT_PATH_OR_ID> <MR_IID>
+#   ./mr_review <MR_URL>
+#   ./mr_review <PROJECT_PATH> <MR_IID>
+#   ./mr_review -d postgres://localhost/mr_review_dev <MR_URL>
 #
-#   MR_URL example:
-#     https://source.modulotech.fr/modulosource/ff/fast/core/-/merge_requests/687
-#
-# Environment:
-#   GITLAB_API_TOKEN   Personal Access Token with api scope (required)
-#   CLAUDE_BIN         Path to claude binary (default: "claude")
-#   CLAUDE_TIMEOUT     Review timeout in seconds (default: 360)
+# Configuration (priority: defaults < config.yml < env vars < CLI flags):
+#   ~/.mr_review/config.yml   Central config file
+#   GITLAB_API_TOKEN          Personal Access Token with api scope
+#   DATABASE_URL              PostgreSQL connection URL
+#   CLAUDE_BIN                Path to claude binary (default: "claude")
+#   CLAUDE_TIMEOUT            Review timeout in seconds (default: 360)
 # =============================================================================
 
 require "bundler/inline"
@@ -30,6 +30,8 @@ gemfile(true) do
   gem "tty-prompt", "~> 0.23"
   gem "tty-editor", "~> 0.7"
   gem "pastel",     "~> 0.8"
+  gem "sequel",     "~> 5.0"
+  gem "pg",         "~> 1.5"
 end
 
 require "cgi"
@@ -37,29 +39,116 @@ require "json"
 require "net/http"
 require "net/https"
 require "open3"
+require "optparse"
 require "shellwords"
 require "tempfile"
 require "timeout"
 require "uri"
+require "yaml"
+
+# ── Exceptions ────────────────────────────────────────────────────────────────
+
+class MrReviewError < StandardError; end
+
+class ClaudeError < MrReviewError; end
+class ClaudeTimeoutError < ClaudeError; end
+class ClaudeParseError < ClaudeError; end
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 REVIEW_BRANCH_PREFIX = "review/mr-"
 REVIEW_MARKER_TAG    = "<!-- mr-reviewer-sha:"
 CONTEXT_LINES        = 4
-CLAUDE_BIN           = ENV.fetch("CLAUDE_BIN", "claude")
-CLAUDE_TIMEOUT_SEC   = ENV.fetch("CLAUDE_TIMEOUT", "360").to_i
+
+# ── Config module ─────────────────────────────────────────────────────────────
+
+module Config
+  CONFIG_DIR  = File.expand_path("~/.mr_review")
+  CONFIG_PATH = File.join(CONFIG_DIR, "config.yml")
+
+  DEFAULTS = {
+    "database_url"     => nil,
+    "gitlab_api_token" => nil,
+    "claude_bin"       => "claude",
+    "claude_timeout"   => 360
+  }.freeze
+
+  ENV_MAPPING = {
+    "DATABASE_URL"     => "database_url",
+    "GITLAB_API_TOKEN" => "gitlab_api_token",
+    "CLAUDE_BIN"       => "claude_bin",
+    "CLAUDE_TIMEOUT"   => "claude_timeout"
+  }.freeze
+
+  def self.load(cli_overrides = {})
+    config = DEFAULTS.dup
+
+    # Layer 2: config.yml
+    if File.exist?(CONFIG_PATH)
+      yaml = YAML.safe_load(File.read(CONFIG_PATH)) || {}
+      yaml.each { |k, v| config[k] = v unless v.nil? }
+    end
+
+    # Layer 3: environment variables
+    ENV_MAPPING.each do |env_key, config_key|
+      config[config_key] = ENV[env_key] if ENV.key?(env_key)
+    end
+
+    # Layer 4: CLI flags (highest priority)
+    cli_overrides.each { |k, v| config[k] = v unless v.nil? }
+
+    # Coerce types
+    config["claude_timeout"] = config["claude_timeout"].to_i
+
+    config
+  end
+end
 
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 def parse_args(argv)
-  case argv.size
+  cli_overrides = {}
+
+  parser = OptionParser.new do |opts|
+    opts.banner = "Usage:\n  mr_review [options] <MR_URL>\n  mr_review [options] <PROJECT_PATH> <MR_IID>"
+
+    opts.on("-d", "--database-url URL", "PostgreSQL connection URL") do |v|
+      cli_overrides["database_url"] = v
+    end
+
+    opts.on("-t", "--token TOKEN", "GitLab API token") do |v|
+      cli_overrides["gitlab_api_token"] = v
+    end
+
+    opts.on("--claude-bin PATH", "Path to claude binary") do |v|
+      cli_overrides["claude_bin"] = v
+    end
+
+    opts.on("--claude-timeout SECONDS", Integer, "Review timeout in seconds") do |v|
+      cli_overrides["claude_timeout"] = v
+    end
+
+    opts.on("-R", "--republish", "Republish comments from the last submitted review") do
+      cli_overrides["republish"] = true
+    end
+
+    opts.on("-h", "--help", "Show this help") do
+      puts opts
+      exit 0
+    end
+  end
+
+  positional = parser.parse(argv)
+
+  config = Config.load(cli_overrides)
+
+  mr_args = case positional.size
   when 1
-    uri   = URI.parse(argv.first)
-    abort "Expected an http(s) URL" unless %w[http https].include?(uri.scheme)
+    uri = URI.parse(positional.first)
+    raise MrReviewError, "Expected an http(s) URL" unless %w[http https].include?(uri.scheme)
 
     base_url, _, mr_segment = uri.path.partition("/-/merge_requests/")
-    abort "URL does not look like a GitLab MR URL" if mr_segment.empty?
+    raise MrReviewError, "URL does not look like a GitLab MR URL" if mr_segment.empty?
 
     {
       base_url:     "#{uri.scheme}://#{uri.host}",
@@ -67,19 +156,217 @@ def parse_args(argv)
       mr_iid:       mr_segment.split("/").first.to_i
     }
   when 2
-    { base_url: nil, project_path: argv[0], mr_iid: argv[1].to_i }
+    { base_url: nil, project_path: positional[0], mr_iid: positional[1].to_i }
   else
-    abort "Usage:\n  mr_reviewer.rb <MR_URL>\n  mr_reviewer.rb <PROJECT_PATH> <MR_IID>"
+    raise MrReviewError, parser.to_s
   end
+
+  mr_args.merge(config: config)
 end
 
 # ── GitLab helpers ────────────────────────────────────────────────────────────
 
-def build_client(base_url)
-  token = ENV.fetch("GITLAB_API_TOKEN") { abort "Missing GITLAB_API_TOKEN env var" }
-  opts  = { private_token: token }
+def build_client(base_url, token)
+  raise MrReviewError, "Missing GitLab API token (set GITLAB_API_TOKEN, use -t, or add to ~/.mr_review/config.yml)" unless token
+  opts = { private_token: token }
   opts[:endpoint] = "#{base_url}/api/v4" if base_url
   Gitlab.client(**opts)
+end
+
+# ── Database module (Sequel + PostgreSQL) ─────────────────────────────────────
+
+module Database
+  @db = nil
+
+  def self.connect(url)
+    return unless url
+    @db = Sequel.connect(url, max_connections: 1)
+    migrate!
+    true
+  rescue Sequel::DatabaseConnectionError, Sequel::DatabaseError => e
+    if e.message.include?("does not exist")
+      return false unless create_database(url)
+      retry
+    end
+    warn "  ⚠ Database connection failed: #{e.message}"
+    @db = nil
+    false
+  end
+
+  def self.create_database(url)
+    uri = URI.parse(url)
+    db_name = uri.path.delete_prefix("/")
+    maintenance_url = url.sub(%r{/[^/]+\z}, "/postgres")
+    temp = Sequel.connect(maintenance_url, max_connections: 1)
+    temp.run("CREATE DATABASE #{temp.literal(db_name.to_sym)}")
+    temp.disconnect
+    warn "  ✓ Created database #{db_name}"
+    true
+  rescue StandardError => e
+    warn "  ⚠ Could not create database: #{e.message}"
+    @db = nil
+    false
+  end
+  private_class_method :create_database
+
+  def self.connected?
+    !@db.nil?
+  end
+
+  def self.disconnect
+    @db&.disconnect
+    @db = nil
+  end
+
+  # ── Schema migration ──
+
+  def self.migrate!
+    @db.run <<~SQL
+      CREATE TABLE IF NOT EXISTS reviews (
+        id                  SERIAL PRIMARY KEY,
+        project_path        TEXT        NOT NULL,
+        mr_iid              INTEGER     NOT NULL,
+        mr_title            TEXT,
+        source_branch       TEXT,
+        target_branch       TEXT,
+        head_sha            VARCHAR(40) NOT NULL,
+        previous_sha        VARCHAR(40),
+        verdict             VARCHAR(20),
+        claude_verdict      VARCHAR(20),
+        status              VARCHAR(20) NOT NULL DEFAULT 'pending',
+        summary             TEXT,
+        comments_total      INTEGER     DEFAULT 0,
+        comments_kept       INTEGER     DEFAULT 0,
+        claude_duration_sec REAL,
+        started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
+        finished_at         TIMESTAMPTZ,
+        CONSTRAINT chk_status CHECK (status IN
+          ('pending','reviewing','validated','submitted','cancelled','error'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_reviews_lookup
+        ON reviews (project_path, mr_iid, head_sha, status);
+    SQL
+
+    @db.run <<~SQL
+      CREATE TABLE IF NOT EXISTS review_comments (
+        id            SERIAL PRIMARY KEY,
+        review_id     INTEGER     NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+        file          TEXT        NOT NULL,
+        line          INTEGER     NOT NULL,
+        severity      VARCHAR(20),
+        category      VARCHAR(20),
+        body          TEXT        NOT NULL,
+        original_body TEXT,
+        status        VARCHAR(20) NOT NULL DEFAULT 'accepted',
+        position      INTEGER     NOT NULL,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CONSTRAINT chk_comment_status CHECK (status IN ('accepted','edited','skipped'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_review_comments_review ON review_comments (review_id);
+    SQL
+
+    @db.run <<~SQL
+      CREATE TABLE IF NOT EXISTS review_errors (
+        id          SERIAL PRIMARY KEY,
+        review_id   INTEGER REFERENCES reviews(id) ON DELETE SET NULL,
+        error_class TEXT        NOT NULL,
+        message     TEXT        NOT NULL,
+        detail      TEXT,
+        phase       VARCHAR(30),
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+      );
+      CREATE INDEX IF NOT EXISTS idx_review_errors_review ON review_errors (review_id);
+    SQL
+  end
+
+  # ── Reviews CRUD ──
+
+  def self.insert_review(project_path:, mr_iid:, head_sha:, mr_title: nil,
+                         source_branch: nil, target_branch: nil, previous_sha: nil)
+    return nil unless connected?
+    @db[:reviews].insert(
+      project_path:  project_path,
+      mr_iid:        mr_iid,
+      head_sha:      head_sha,
+      mr_title:      mr_title,
+      source_branch: source_branch,
+      target_branch: target_branch,
+      previous_sha:  previous_sha,
+      status:        "pending"
+    )
+  end
+
+  def self.update_review(review_id, **fields)
+    return unless connected? && review_id
+    @db[:reviews].where(id: review_id).update(**fields)
+  end
+
+  def self.find_validated_review(project_path, mr_iid, head_sha)
+    return nil unless connected?
+    @db[:reviews].where(
+      project_path: project_path,
+      mr_iid:       mr_iid,
+      head_sha:     head_sha,
+      status:       "validated"
+    ).order(Sequel.desc(:id)).first
+  end
+
+  def self.find_submitted_review(project_path, mr_iid)
+    return nil unless connected?
+    @db[:reviews].where(
+      project_path: project_path,
+      mr_iid:       mr_iid,
+      status:       "submitted"
+    ).order(Sequel.desc(:id)).first
+  end
+
+  def self.last_reviewed_sha(project_path, mr_iid)
+    return nil unless connected?
+    row = @db[:reviews].where(
+      project_path: project_path,
+      mr_iid:       mr_iid,
+      status:       "submitted"
+    ).order(Sequel.desc(:id)).select(:head_sha).first
+    row&.[](:head_sha)
+  end
+
+  # ── Comments CRUD ──
+
+  def self.insert_comment(review_id:, file:, line:, severity:, category:,
+                          body:, original_body: nil, status:, position:)
+    return unless connected? && review_id
+    @db[:review_comments].insert(
+      review_id:     review_id,
+      file:          file,
+      line:          line,
+      severity:      severity,
+      category:      category,
+      body:          body,
+      original_body: original_body,
+      status:        status,
+      position:      position
+    )
+  end
+
+  def self.comments_for_review(review_id)
+    return [] unless connected? && review_id
+    @db[:review_comments].where(review_id: review_id).order(:position).all
+  end
+
+  # ── Errors CRUD ──
+
+  def self.insert_error(review_id: nil, error_class:, message:, detail: nil, phase: nil)
+    return unless connected?
+    @db[:review_errors].insert(
+      review_id:   review_id,
+      error_class: error_class,
+      message:     message,
+      detail:      detail,
+      phase:       phase
+    )
+  rescue StandardError => e
+    warn "  ⚠ Failed to log error to DB: #{e.message}"
+  end
 end
 
 # URL-encode a project path so slashes become %2F for the REST API path segment.
@@ -121,6 +408,13 @@ class BranchManager
   end
 
   def setup!
+    # If we're already on the review branch (leftover from a previous interrupted run),
+    # switch away first so the fetch can update it.
+    if @original_branch == @review_branch
+      default = detect_default_branch
+      git! "checkout #{default}"
+      @original_branch = default
+    end
     git! "fetch origin #{@source_branch}:#{@review_branch} --force --no-tags"
     git! "checkout #{@review_branch}"
   end
@@ -134,13 +428,18 @@ class BranchManager
 
   def current_branch
     branch = `git rev-parse --abbrev-ref HEAD 2>/dev/null`.strip
-    abort "Not inside a git repository (or HEAD is detached)" if branch.empty? || branch == "HEAD"
+    raise MrReviewError, "Not inside a git repository (or HEAD is detached)" if branch.empty? || branch == "HEAD"
     branch
+  end
+
+  def detect_default_branch
+    ref = `git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null`.strip
+    ref.empty? ? "main" : ref.sub("refs/remotes/origin/", "")
   end
 
   def git!(cmd)
     out, status = Open3.capture2e("git #{cmd}")
-    abort "git #{cmd}\n  failed: #{out.strip}" unless status.success?
+    raise MrReviewError, "git #{cmd}\n  failed: #{out.strip}" unless status.success?
   end
 end
 
@@ -205,40 +504,70 @@ REVIEW_PROMPT = <<~PROMPT
   - The `comments` array may be empty only when `verdict` is `"approve"`.
 PROMPT
 
-def run_claude_review(target_branch, review_branch)
+REVIEW_JSON_SCHEMA = {
+  type: "object",
+  required: %w[summary verdict comments],
+  additionalProperties: false,
+  properties: {
+    summary: { type: "string", description: "Overall assessment in French, 3-10 sentences, markdown" },
+    verdict: { type: "string", enum: %w[approve request_changes] },
+    comments: {
+      type: "array",
+      items: {
+        type: "object",
+        required: %w[file line severity category body],
+        additionalProperties: false,
+        properties: {
+          file:     { type: "string", description: "Relative file path from repo root" },
+          line:     { type: "integer", description: "Line number in the NEW version of the file" },
+          severity: { type: "string", enum: %w[error warning info nitpick] },
+          category: { type: "string", enum: %w[bug security logic performance style test other] },
+          body:     { type: "string", description: "Markdown comment in French" }
+        }
+      }
+    }
+  }
+}.freeze
+
+def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:)
   prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch)
 
   raw_output = nil
-  Timeout.timeout(CLAUDE_TIMEOUT_SEC) do
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  schema_json = Shellwords.escape(JSON.generate(REVIEW_JSON_SCHEMA))
+
+  Timeout.timeout(claude_timeout) do
     # Write output to a temp file to avoid pipe buffer truncation on large reviews.
     Tempfile.create(["claude_review", ".txt"]) do |f|
       f.close
-      system("#{CLAUDE_BIN} -p #{Shellwords.escape(prompt)} > #{Shellwords.escape(f.path)} 2>&1")
+      system("#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json} > #{Shellwords.escape(f.path)} 2>&1")
       unless $CHILD_STATUS.success?
-        abort "#{CLAUDE_BIN} -p exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
+        raise ClaudeError, "#{claude_bin} -p exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
       end
       raw_output = File.read(f.path)
     end
   end
 
-  # Claude Code sometimes emits prose before/after the JSON, and/or wraps it in
-  # a markdown code fence.  Try strategies in order:
-  #   1. First ```json ... ``` or ``` ... ``` block
-  #   2. First top-level JSON object { ... } in the output
-  #   3. Raw output as-is (will raise JSON::ParserError with useful context)
-  json_str = if (m = raw_output.match(/```(?:json)?\s*\n(.*?)```/m))
-    m[1].strip
-  elsif (m = raw_output.match(/(\{.*\})/m))
-    m[1].strip
+  duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+
+  # With --output-format json + --json-schema, Claude wraps the result in a JSON envelope.
+  # The structured output lives in "structured_output", not "result".
+  envelope = JSON.parse(raw_output)
+
+  review = if envelope.is_a?(Hash) && envelope["structured_output"].is_a?(Hash)
+    envelope["structured_output"]
+  elsif envelope.is_a?(Hash) && envelope["result"].is_a?(String) && !envelope["result"].empty?
+    JSON.parse(envelope["result"])
   else
-    raw_output.strip
+    raise ClaudeParseError, "Unexpected envelope structure: #{envelope.keys.inspect}"
   end
 
-  JSON.parse(json_str)
+  { "review" => review, "duration" => duration.round(1) }
 rescue Timeout::Error
-  abort "Claude Code timed out after #{CLAUDE_TIMEOUT_SEC}s. Try increasing CLAUDE_TIMEOUT."
+  raise ClaudeTimeoutError, "Claude Code timed out after #{claude_timeout}s. Try increasing CLAUDE_TIMEOUT."
 rescue JSON::ParserError => e
-  abort "Claude returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output}"
+  raise ClaudeParseError, "Claude returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
 end
 
 # ── Interactive comment validator ─────────────────────────────────────────────
@@ -250,14 +579,16 @@ class CommentValidator
     @prompt   = prompt
   end
 
-  # Returns the list of accepted (and possibly edited) comments.
+  # Returns ALL comments (accepted, edited, and skipped) with tracking metadata:
+  #   _review_status  : "accepted" | "edited" | "skipped"
+  #   _original_body  : original Claude body (only when edited)
   def run
     return [] if @comments.empty?
 
     puts @pastel.bold.cyan("\n── Reviewing #{@comments.size} comment(s) ───────────────────────")
 
-    @comments.each_with_object([]) do |comment, accepted|
-      render_comment(comment, accepted.size + 1)
+    @comments.each_with_index.map do |comment, idx|
+      render_comment(comment, idx + 1)
 
       action = @prompt.select(
         "Action?",
@@ -268,12 +599,20 @@ class CommentValidator
 
       case action
       when "Accept"
-        accepted << comment
+        comment.merge("_review_status" => "accepted")
       when "Edit"
         edited_body = edit_in_editor(comment["body"])
-        accepted << comment.merge("body" => edited_body) if edited_body&.strip&.length&.positive?
+        if edited_body&.strip&.length&.positive?
+          comment.merge(
+            "_review_status" => "edited",
+            "_original_body" => comment["body"],
+            "body"           => edited_body
+          )
+        else
+          comment.merge("_review_status" => "skipped")
+        end
       when "Skip"
-        # discard
+        comment.merge("_review_status" => "skipped")
       end
     end
   end
@@ -375,8 +714,10 @@ class ReviewSubmitter
       parsed = JSON.parse(@body) rescue nil
       if parsed.is_a?(Hash) && parsed["message"]
         parsed["message"].is_a?(Array) ? parsed["message"].join(", ") : parsed["message"].to_s
+      elsif parsed.is_a?(Hash) && parsed["error"]
+        parsed["error"].to_s
       else
-        @body
+        @body[0, 200]
       end
     end
   end
@@ -393,6 +734,8 @@ class ReviewSubmitter
   # then approves the MR if verdict is "approve".
   # Raises ApiError on any unrecoverable GitLab error.
   def submit(comments:, summary:, verdict:, sha:, gitlab_client:)
+    delete_stale_drafts!
+
     inline_errors = []
     comments.each do |comment|
       create_draft_note(comment["body"], position: build_position(comment))
@@ -417,12 +760,38 @@ class ReviewSubmitter
 
   def create_draft_note(body, position: nil)
     payload = { note: body }
-    payload[:position] = build_position(position) if position
+    payload[:position] = position if position
     http_post(draft_notes_uri, payload)
   end
 
+  def delete_stale_drafts!
+    drafts = http_get(draft_notes_uri)
+    return unless drafts.is_a?(Array) && !drafts.empty?
+
+    warn "  ⚠ Deleting #{drafts.size} stale draft note(s) from previous attempts…"
+    drafts.each do |draft|
+      http_delete(URI("#{draft_notes_uri}/#{draft["id"]}"))
+    rescue ApiError
+      # best effort
+    end
+  end
+
   def publish_all_drafts!
-    http_post(URI("#{draft_notes_uri}/bulk_publish"), {})
+    drafts = http_get(draft_notes_uri)
+    return if drafts.empty?
+
+    publish_errors = []
+    drafts.each do |draft|
+      uri = URI("#{draft_notes_uri}/#{draft["id"]}/publish")
+      http_put(uri)
+    rescue ApiError => e
+      publish_errors << "draft##{draft["id"]} — #{e.status}: #{e.detail}"
+    end
+
+    unless publish_errors.empty?
+      warn "\n  ⚠ #{publish_errors.size} draft(s) failed to publish:"
+      publish_errors.each { |err| warn "    • #{err}" }
+    end
   end
 
   def build_position(comment)
@@ -431,6 +800,7 @@ class ReviewSubmitter
       base_sha:      @diff_refs.base_sha,
       start_sha:     @diff_refs.start_sha,
       head_sha:      @diff_refs.head_sha,
+      old_path:      comment["file"],
       new_path:      comment["file"],
       new_line:      comment["line"]
     }
@@ -452,138 +822,319 @@ class ReviewSubmitter
 
     response = http.request(req)
     code     = response.code.to_i
-    raise ApiError.new(code, response.body) unless (200..299).cover?(code)
+    unless (200..299).cover?(code)
+      warn "  [DEBUG] POST #{uri.path} → #{code}"
+      warn "  [DEBUG] Request body: #{payload.to_json[0, 500]}"
+      warn "  [DEBUG] Response body: #{response.body[0, 500]}"
+      raise ApiError.new(code, response.body)
+    end
 
     JSON.parse(response.body) rescue {}
+  end
+
+  def http_get(uri)
+    http              = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl      = (uri.scheme == "https")
+    http.read_timeout = 30
+
+    req = Net::HTTP::Get.new(uri)
+    req["PRIVATE-TOKEN"] = @token
+
+    response = http.request(req)
+    code     = response.code.to_i
+    raise ApiError.new(code, response.body) unless (200..299).cover?(code)
+
+    JSON.parse(response.body) rescue []
+  end
+
+  def http_put(uri)
+    http              = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl      = (uri.scheme == "https")
+    http.read_timeout = 30
+
+    req = Net::HTTP::Put.new(uri)
+    req["PRIVATE-TOKEN"] = @token
+
+    response = http.request(req)
+    code     = response.code.to_i
+    unless (200..299).cover?(code)
+      warn "  [DEBUG] PUT #{uri.path} → #{code}"
+      warn "  [DEBUG] Response body: #{response.body[0, 500]}"
+      raise ApiError.new(code, response.body)
+    end
+  end
+
+  def http_delete(uri)
+    http              = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl      = (uri.scheme == "https")
+    http.read_timeout = 30
+
+    req = Net::HTTP::Delete.new(uri)
+    req["PRIVATE-TOKEN"] = @token
+
+    response = http.request(req)
+    code     = response.code.to_i
+    raise ApiError.new(code, response.body) unless (200..299).cover?(code)
   end
 end
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-pastel = Pastel.new
-prompt = TTY::Prompt.new
-token  = ENV.fetch("GITLAB_API_TOKEN") { abort "Missing GITLAB_API_TOKEN env var" }
+def main
+  pastel = Pastel.new
+  tty    = TTY::Prompt.new
 
-puts pastel.bold.blue("╔═ MR Reviewer ═══════════════════════════════════════╗")
+  current_phase = "arg_parse"
+  review_id     = nil
+  branch_mgr    = nil
 
-# 1. Parse CLI args
-args    = parse_args(ARGV)
-client  = build_client(args[:base_url])
-project = args[:project_path]
-mr_iid  = args[:mr_iid]
+  puts pastel.bold.blue("╔═ MR Reviewer ═══════════════════════════════════════╗")
 
-# 2. Fetch MR metadata
-puts "  Fetching MR !#{mr_iid} from #{project}…"
-mr = client.merge_request(project, mr_iid)
+  # 1. Parse CLI args + load config
+  args    = parse_args(ARGV)
+  config  = args[:config]
+  token   = config["gitlab_api_token"]
+  client  = build_client(args[:base_url], token)
+  project = args[:project_path]
+  mr_iid  = args[:mr_iid]
 
-puts pastel.green("  #{mr.title}")
-puts "  #{mr.source_branch} → #{mr.target_branch}"
-puts "  HEAD: #{mr.sha[0, 8]}"
+  claude_bin     = config["claude_bin"]
+  claude_timeout = config["claude_timeout"]
 
-# 3. Idempotence – skip if this exact commit was already reviewed
-reviewed_sha = last_reviewed_sha(client, project, mr_iid)
-
-if reviewed_sha == mr.sha
-  puts pastel.yellow("\n  Commit #{mr.sha[0, 8]} has already been reviewed. Nothing to do.")
-  exit 0
-end
-
-puts pastel.cyan("  Previous review SHA: #{reviewed_sha[0, 8]}") if reviewed_sha
-
-# 4. Checkout source branch under a private review branch name
-branch_mgr = BranchManager.new(mr.source_branch, mr_iid)
-at_exit { branch_mgr&.teardown! }
-branch_mgr.setup!
-puts pastel.green("  ✓ Checked out #{branch_mgr.review_branch}")
-
-# 5. Run Claude Code review
-puts pastel.bold("\n  ⏳ Running Claude Code review (timeout: #{CLAUDE_TIMEOUT_SEC}s)…")
-review = run_claude_review(mr.target_branch, branch_mgr.review_branch)
-
-puts pastel.green("  ✓ #{review["comments"].size} comment(s) — initial verdict: #{review["verdict"]}")
-
-# 6. Interactive comment validation — or resume from saved draft
-approved_comments = nil
-final_summary     = nil
-final_verdict     = nil
-
-draft = DraftState.load(mr_iid)
-if draft && draft["sha"] == mr.sha
-  puts pastel.yellow("\n  ⚠ A saved draft exists for commit #{mr.sha[0, 8]} (#{DraftState.path(mr_iid)}).")
-  if prompt.yes?("Resume from saved draft? (No = re-run Claude review)")
-    approved_comments = draft["comments"]
-    final_summary     = draft["summary"]
-    final_verdict     = draft["verdict"]
-    puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from draft.")
-  end
-end
-
-unless approved_comments
-  validator         = CommentValidator.new(review["comments"], pastel: pastel, prompt: prompt)
-  approved_comments = validator.run
-
-  has_blocking  = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
-  final_verdict = has_blocking ? "request_changes" : review["verdict"]
-  final_summary = review["summary"]
-end
-
-# 7. Final review screen — summary edit + confirmation
-loop do
-  system("clear")
-  puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
-  puts final_summary
-  puts
-  puts "  Inline comments : #{approved_comments.size} / #{review["comments"].size} kept"
-
-  verdict_display = if final_verdict == "approve"
-    pastel.green.bold("APPROVE ✓")
-  else
-    pastel.red.bold("REQUEST CHANGES ✗")
-  end
-  puts "  Verdict         : #{verdict_display}"
-  puts
-
-  action = prompt.select("Action?", ["Submit", "Edit summary", "Cancel"], cycle: true)
-
-  case action
-  when "Edit summary"
-    edited = nil
-    Tempfile.create(["mr_summary", ".md"]) do |f|
-      f.write(final_summary)
-      f.flush
-      TTY::Editor.open(f.path)
-      edited = File.read(f.path).strip
+  # 2. Connect to database (optional — graceful degradation)
+  current_phase = "db_connect"
+  if config["database_url"]
+    if Database.connect(config["database_url"])
+      puts pastel.dim("  ✓ Database connected")
     end
-    final_summary = edited if edited && !edited.empty?
-  when "Cancel"
-    puts pastel.yellow("  Review cancelled. Nothing was submitted.")
-    exit 0
-  when "Submit"
-    break
   end
-end
 
-# 8. Persist draft before any GitLab call
-DraftState.save(mr_iid,
-  comments: approved_comments,
-  summary:  final_summary,
-  verdict:  final_verdict,
-  sha:      mr.sha
-)
-puts pastel.dim("  Draft saved to #{DraftState.path(mr_iid)}")
+  # 3. Fetch MR metadata
+  current_phase = "fetch_mr"
+  puts "  Fetching MR !#{mr_iid} from #{project}…"
+  mr = client.merge_request(project, mr_iid)
 
-# 9. Submit to GitLab
-base_url = args[:base_url] || "https://#{URI.parse(client.endpoint).host}"
+  puts pastel.green("  #{mr.title}")
+  puts "  #{mr.source_branch} → #{mr.target_branch}"
+  puts "  HEAD: #{mr.sha[0, 8]}"
 
-submitter = ReviewSubmitter.new(
-  base_url:   base_url,
-  token:      token,
-  project_id: project,
-  mr_iid:     mr_iid,
-  diff_refs:  mr.diff_refs
-)
+  # 3b. Republish mode — re-submit comments from a previous successful review
+  if config["republish"]
+    current_phase = "republish"
+    raise MrReviewError, "Republish requires a database connection (-d or DATABASE_URL)" unless Database.connected?
 
-begin
+    prev = Database.find_submitted_review(project, mr_iid)
+    raise MrReviewError, "No submitted review found for #{project} !#{mr_iid}" unless prev
+
+    db_comments       = Database.comments_for_review(prev[:id])
+    approved_comments = db_comments.select { |c| c[:status] != "skipped" }.map do |c|
+      { "file" => c[:file], "line" => c[:line], "severity" => c[:severity],
+        "category" => c[:category], "body" => c[:body] }
+    end
+    final_summary = prev[:summary]
+    final_verdict = prev[:verdict]
+
+    puts pastel.cyan("  Republishing review ##{prev[:id]} (#{prev[:head_sha][0, 8]}, #{approved_comments.size} comment(s))")
+
+    base_url = args[:base_url] || "https://#{URI.parse(client.endpoint).host}"
+    submitter = ReviewSubmitter.new(
+      base_url: base_url, token: token, project_id: project,
+      mr_iid: mr_iid, diff_refs: mr.diff_refs
+    )
+    submitter.submit(
+      comments: approved_comments, summary: final_summary,
+      verdict: final_verdict, sha: mr.sha, gitlab_client: client
+    )
+    puts pastel.bold.green("\n  ✅ Review republished (#{final_verdict.gsub("_", " ")}).")
+    exit 0
+  end
+
+  # 4. INSERT review (status: pending)
+  review_id = Database.insert_review(
+    project_path:  project,
+    mr_iid:        mr_iid,
+    head_sha:      mr.sha,
+    mr_title:      mr.title,
+    source_branch: mr.source_branch,
+    target_branch: mr.target_branch
+  )
+
+  # 5. Idempotence — DB first, GitLab notes fallback
+  current_phase = "idempotence"
+  reviewed_sha = Database.last_reviewed_sha(project, mr_iid) ||
+                 last_reviewed_sha(client, project, mr_iid)
+
+  if reviewed_sha == mr.sha
+    puts pastel.yellow("\n  Commit #{mr.sha[0, 8]} has already been reviewed. Nothing to do.")
+    Database.update_review(review_id, status: "submitted", previous_sha: reviewed_sha, finished_at: Sequel.function(:now))
+    exit 0
+  end
+
+  Database.update_review(review_id, previous_sha: reviewed_sha) if reviewed_sha
+  puts pastel.cyan("  Previous review SHA: #{reviewed_sha[0, 8]}") if reviewed_sha
+
+  # 6. Resume check — DB first, DraftState fallback
+  approved_comments = nil
+  all_comments      = nil
+  final_summary     = nil
+  final_verdict     = nil
+  total_comments    = nil
+
+  db_draft = Database.find_validated_review(project, mr_iid, mr.sha)
+  if db_draft
+    puts pastel.yellow("\n  ⚠ A validated review exists in DB for commit #{mr.sha[0, 8]}.")
+    if tty.yes?("Resume from DB draft? (No = start fresh)")
+      db_comments       = Database.comments_for_review(db_draft[:id])
+      approved_comments = db_comments.select { |c| c[:status] != "skipped" }.map do |c|
+        { "file" => c[:file], "line" => c[:line], "severity" => c[:severity],
+          "category" => c[:category], "body" => c[:body] }
+      end
+      final_summary  = db_draft[:summary]
+      final_verdict  = db_draft[:verdict]
+      total_comments = db_draft[:comments_total]
+      # Reuse existing review row
+      review_id = db_draft[:id]
+      puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from DB.")
+    end
+  end
+
+  if !approved_comments
+    file_draft = DraftState.load(mr_iid)
+    if file_draft && file_draft["sha"] == mr.sha
+      puts pastel.yellow("\n  ⚠ A saved draft exists for commit #{mr.sha[0, 8]} (#{DraftState.path(mr_iid)}).")
+      if tty.yes?("Resume from saved draft? (No = start fresh)")
+        approved_comments = file_draft["comments"]
+        final_summary     = file_draft["summary"]
+        final_verdict     = file_draft["verdict"]
+        total_comments    = approved_comments.size
+        puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from draft file.")
+      end
+    end
+  end
+
+  unless approved_comments
+    # 7. Checkout source branch
+    current_phase = "checkout"
+    branch_mgr = BranchManager.new(mr.source_branch, mr_iid)
+    at_exit { branch_mgr&.teardown! }
+    branch_mgr.setup!
+    puts pastel.green("  ✓ Checked out #{branch_mgr.review_branch}")
+
+    # 8. Run Claude Code review
+    current_phase = "claude"
+    Database.update_review(review_id, status: "reviewing")
+    puts pastel.bold("\n  ⏳ Running Claude Code review (timeout: #{claude_timeout}s)…")
+
+    result   = run_claude_review(mr.target_branch, branch_mgr.review_branch,
+                                 claude_bin: claude_bin, claude_timeout: claude_timeout)
+    review   = result["review"]
+    duration = result["duration"]
+
+    Database.update_review(review_id, claude_duration_sec: duration, claude_verdict: review["verdict"])
+    puts pastel.green("  ✓ #{review["comments"].size} comment(s) — initial verdict: #{review["verdict"]} (#{duration}s)")
+
+    total_comments = review["comments"].size
+
+    # 9. Interactive comment validation
+    current_phase = "validate"
+    validator     = CommentValidator.new(review["comments"], pastel: pastel, prompt: tty)
+    all_comments  = validator.run
+
+    # Insert all comments into DB
+    all_comments.each_with_index do |c, idx|
+      Database.insert_comment(
+        review_id:     review_id,
+        file:          c["file"],
+        line:          c["line"],
+        severity:      c["severity"],
+        category:      c["category"],
+        body:          c["body"],
+        original_body: c["_original_body"],
+        status:        c["_review_status"],
+        position:      idx + 1
+      )
+    end
+
+    approved_comments = all_comments.reject { |c| c["_review_status"] == "skipped" }
+
+    has_blocking  = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
+    final_verdict = has_blocking ? "request_changes" : review["verdict"]
+    final_summary = review["summary"]
+
+    # 10. UPDATE status: validated
+    Database.update_review(review_id,
+      status:         "validated",
+      verdict:        final_verdict,
+      summary:        final_summary,
+      comments_total: total_comments,
+      comments_kept:  approved_comments.size
+    )
+  end
+
+  # 11. Final review screen — summary edit + confirmation
+  current_phase = "validate"
+  loop do
+    system("clear")
+    puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
+    puts final_summary
+    puts
+    puts "  Inline comments : #{approved_comments.size} / #{total_comments} kept"
+
+    verdict_display = if final_verdict == "approve"
+      pastel.green.bold("APPROVE ✓")
+    else
+      pastel.red.bold("REQUEST CHANGES ✗")
+    end
+    puts "  Verdict         : #{verdict_display}"
+    puts
+
+    action = tty.select("Action?", ["Submit", "Edit summary", "Cancel"], cycle: true)
+
+    case action
+    when "Edit summary"
+      edited = nil
+      Tempfile.create(["mr_summary", ".md"]) do |f|
+        f.write(final_summary)
+        f.flush
+        TTY::Editor.open(f.path)
+        edited = File.read(f.path).strip
+      end
+      if edited && !edited.empty?
+        final_summary = edited
+        Database.update_review(review_id, summary: final_summary)
+      end
+    when "Cancel"
+      Database.update_review(review_id, status: "cancelled", finished_at: Sequel.function(:now))
+      puts pastel.yellow("  Review cancelled. Nothing was submitted.")
+      exit 0
+    when "Submit"
+      break
+    end
+  end
+
+  # 12. Persist draft as fallback before any GitLab call
+  current_phase = "submit"
+  unless Database.connected?
+    DraftState.save(mr_iid,
+      comments: approved_comments,
+      summary:  final_summary,
+      verdict:  final_verdict,
+      sha:      mr.sha
+    )
+    puts pastel.dim("  Draft saved to #{DraftState.path(mr_iid)}")
+  end
+
+  # 13. Submit to GitLab
+  base_url = args[:base_url] || "https://#{URI.parse(client.endpoint).host}"
+
+  submitter = ReviewSubmitter.new(
+    base_url:   base_url,
+    token:      token,
+    project_id: project,
+    mr_iid:     mr_iid,
+    diff_refs:  mr.diff_refs
+  )
+
   submitter.submit(
     comments:       approved_comments,
     summary:        final_summary,
@@ -591,13 +1142,56 @@ begin
     sha:            mr.sha,
     gitlab_client:  client
   )
-rescue ReviewSubmitter::ApiError => e
-  puts pastel.red.bold("\n  ✖ GitLab API error: #{e}")
-  puts pastel.red("    #{e.detail}")
-  puts
-  puts pastel.yellow("  Draft saved — re-run the script to retry without losing your edits.")
+
+  # 14. UPDATE status: submitted
+  Database.update_review(review_id,
+    status:      "submitted",
+    finished_at: Sequel.function(:now)
+  )
+
+  DraftState.delete(mr_iid)
+  puts pastel.bold.green("\n  ✅ Review submitted (#{final_verdict.gsub("_", " ")}).")
+
+rescue MrReviewError, ReviewSubmitter::ApiError => e
+  Database.insert_error(
+    review_id:   review_id,
+    error_class: e.class.name,
+    message:     e.message,
+    phase:       current_phase
+  )
+  Database.update_review(review_id, status: "error", finished_at: Sequel.function(:now))
+
+  pastel ||= Pastel.new
+  warn pastel.red.bold("\n  ✖ #{e.class}: #{e.message}")
+  if e.is_a?(ReviewSubmitter::ApiError)
+    warn pastel.red("    #{e.detail}")
+    warn pastel.yellow("  Draft saved — re-run the script to retry without losing your edits.") unless Database.connected?
+  end
   exit 1
+
+rescue Interrupt
+  Database.update_review(review_id, status: "cancelled", finished_at: Sequel.function(:now))
+  pastel ||= Pastel.new
+  warn pastel.yellow("\n  Interrupted. Review cancelled.")
+  exit 130
+
+rescue StandardError => e
+  Database.insert_error(
+    review_id:   review_id,
+    error_class: e.class.name,
+    message:     e.message,
+    detail:      e.backtrace&.first(10)&.join("\n"),
+    phase:       current_phase
+  )
+  Database.update_review(review_id, status: "error", finished_at: Sequel.function(:now))
+
+  pastel ||= Pastel.new
+  warn pastel.red.bold("\n  ✖ Unexpected error: #{e.class}: #{e.message}")
+  warn pastel.dim(e.backtrace&.first(5)&.join("\n  "))
+  exit 1
+
+ensure
+  Database.disconnect
 end
 
-DraftState.delete(mr_iid)
-puts pastel.bold.green("\n  ✅ Review submitted (#{final_verdict.gsub("_", " ")}).")
+main

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A single-file Ruby CLI tool (`mr_review`) that automates GitLab Merge Request code reviews using Claude Code. It fetches an MR diff, invokes `claude -p` to produce a structured JSON review, presents each comment interactively for human validation (accept/edit/skip), then submits the approved comments as GitLab draft notes and approves or requests changes.
+A single-file Ruby CLI tool (`mr_review`) that automates GitLab Merge Request code reviews using Claude Code. It fetches an MR diff, invokes `claude -p` to produce a structured JSON review, presents each comment interactively for human validation (accept/edit/skip), then submits the approved comments as GitLab draft notes and approves or requests changes. All review data is persisted to PostgreSQL for tracking and analytics.
 
 ## Running
 
@@ -14,27 +14,87 @@ A single-file Ruby CLI tool (`mr_review`) that automates GitLab Merge Request co
 
 # Review by project path + MR IID
 ./mr_review modulosource/ff/fast/core 687
+
+# With explicit database URL
+./mr_review -d postgres://localhost/mr_review_dev <MR_URL>
+
+# With explicit token
+./mr_review -t glpat-xxxx <MR_URL>
 ```
 
 Dependencies are installed automatically via `bundler/inline` (no separate `bundle install` needed). Requires Ruby and the `claude` CLI on PATH.
 
-## Required Environment Variables
+## Configuration
 
-- `GITLAB_API_TOKEN` — Personal Access Token with `api` scope (required)
-- `CLAUDE_BIN` — path to claude binary (default: `"claude"`)
-- `CLAUDE_TIMEOUT` — review timeout in seconds (default: `360`)
+Settings are resolved in 4 layers (highest priority wins):
+
+1. **Defaults** — `claude_bin: "claude"`, `claude_timeout: 360`
+2. **Config file** — `~/.mr_review/config.yml`
+3. **Environment variables** — `GITLAB_API_TOKEN`, `DATABASE_URL`, `CLAUDE_BIN`, `CLAUDE_TIMEOUT`
+4. **CLI flags** — `-d`/`--database-url`, `-t`/`--token`, `--claude-bin`, `--claude-timeout`
+
+### Config file example (`~/.mr_review/config.yml`)
+
+```yaml
+database_url: postgres://localhost/mr_review_dev
+gitlab_api_token: glpat-xxxxxxxxxxxxxxxxxxxx
+claude_bin: claude
+claude_timeout: 360
+```
+
+### CLI flags
+
+- `-d` / `--database-url URL` — PostgreSQL connection URL
+- `-t` / `--token TOKEN` — GitLab API token
+- `--claude-bin PATH` — Path to claude binary
+- `--claude-timeout SECONDS` — Review timeout in seconds
+- `-h` / `--help` — Show help
 
 ## Architecture
 
-The script follows a linear pipeline in `main`:
+The script follows a linear pipeline in the `main` method:
 
-1. **Argument parsing** (`parse_args`) — accepts either a full GitLab MR URL or `<project_path> <mr_iid>`
-2. **Idempotence check** (`last_reviewed_sha`) — scans MR notes for the marker tag `<!-- mr-reviewer-sha:... -->` to skip already-reviewed commits
-3. **Branch checkout** (`BranchManager`) — fetches the MR source branch into a local `review/mr-<iid>` branch; restores the original branch via `at_exit`
-4. **Claude Code review** (`run_claude_review`) — sends a prompt to `claude -p` requesting a JSON object with `summary`, `verdict`, and `comments[]`; extracts JSON from possibly fenced or prefixed output
-5. **Interactive validation** (`CommentValidator`) — TTY-based accept/edit/skip loop per comment, with file context display
-6. **Draft persistence** (`DraftState`) — saves validated review to `.mr_review_draft_<iid>.json` before any API call, enabling retry after network failures
-7. **GitLab submission** (`ReviewSubmitter`) — uses raw `Net::HTTP` for draft notes (the `gitlab` gem lacks this endpoint), then bulk-publishes and optionally approves
+1. **Argument parsing** (`parse_args` + `Config.load`) — OptionParser for flags, positional args for MR URL or `<project_path> <mr_iid>`
+2. **Database connection** (`Database.connect`) — optional, graceful degradation if unavailable
+3. **Fetch MR metadata** — GitLab API call
+4. **INSERT review** — DB row with `status: pending`
+5. **Idempotence check** — DB `last_reviewed_sha` first, GitLab notes fallback
+6. **Resume check** — DB `find_validated_review` first, `DraftState` file fallback
+7. **Branch checkout** (`BranchManager`) — fetches the MR source branch into a local `review/mr-<iid>` branch; restores the original branch via `at_exit`
+8. **Claude Code review** (`run_claude_review`) — `status: reviewing`, measures duration
+9. **Interactive validation** (`CommentValidator`) — returns ALL comments with `_review_status` (accepted/edited/skipped); all inserted into DB
+10. **UPDATE validated** — verdict, summary, comments_kept
+11. **Final review screen** — edit summary / cancel / submit
+12. **GitLab submission** (`ReviewSubmitter`) — draft notes + bulk publish + optional approve
+13. **UPDATE submitted** — `finished_at`, cleanup DraftState file
+
+### Error handling
+
+All `abort` calls have been replaced by a custom exception hierarchy:
+
+```
+MrReviewError < StandardError
+  ClaudeError < MrReviewError
+    ClaudeTimeoutError < ClaudeError
+    ClaudeParseError < ClaudeError
+```
+
+The `main` method wraps everything in `begin...rescue`:
+- `MrReviewError`, `ReviewSubmitter::ApiError` → log to DB + stderr + exit 1
+- `Interrupt` → `status: cancelled` + exit 130
+- `StandardError` (catch-all) → `status: error` + backtrace to DB + exit 1
+
+A `current_phase` variable tracks the pipeline stage for error reporting.
+
+## PostgreSQL Schema
+
+Three normalized tables (`CREATE TABLE IF NOT EXISTS` auto-migration at each launch):
+
+- **`reviews`** — one row per script execution (project, MR, SHA, status lifecycle, verdict, timing)
+- **`review_comments`** — every Claude comment with its validation outcome (accepted/edited/skipped, original_body if edited)
+- **`review_errors`** — errors logged with phase and backtrace
+
+The DB is optional. Without `DATABASE_URL`, the script falls back to `DraftState` (local JSON file) and GitLab notes for idempotence — same behavior as before.
 
 ## Key Design Decisions
 
@@ -42,3 +102,6 @@ The script follows a linear pipeline in `main`:
 - **Verdict logic**: After interactive validation, the verdict is recalculated — if any accepted comment has severity `error` or `warning`, the verdict becomes `request_changes` regardless of Claude's original verdict.
 - **Draft notes over regular notes**: Uses GitLab's draft notes API (`/draft_notes`) + bulk publish so the review appears as a single atomic batch, not individual comments.
 - **No gem for draft notes**: `ReviewSubmitter` uses `Net::HTTP` directly because the `gitlab` gem doesn't expose the draft notes endpoint.
+- **Graceful degradation**: All DB operations are guarded by `Database.connected?` — the script works identically without a database.
+- **All comments tracked**: `CommentValidator` returns every comment (not just accepted), enriched with `_review_status` and `_original_body` for full audit trail.
+- **Config layering**: 4-layer priority (defaults < config.yml < env < CLI) via `Config` module avoids hardcoded env var lookups.
