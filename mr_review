@@ -277,6 +277,8 @@ module Database
       );
       CREATE INDEX IF NOT EXISTS idx_review_errors_review ON review_errors (review_id);
     SQL
+
+    @db.run "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS pipeline_summary TEXT;"
   end
 
   # ── Reviews CRUD ──
@@ -428,6 +430,98 @@ class RepoManager
   end
 end
 
+# ── Pipeline fetcher ──────────────────────────────────────────────────────────
+
+class PipelineFetcher
+  attr_reader :pipeline, :jobs, :failed_jobs
+
+  def initialize(client:, project:, mr_iid:, head_sha:, repo_path:)
+    @client    = client
+    @project   = project
+    @mr_iid    = mr_iid
+    @head_sha  = head_sha
+    @repo_path = repo_path
+    @pipeline  = nil
+    @jobs      = []
+    @failed_jobs = []
+  end
+
+  # Returns true if a pipeline was found and processed, false otherwise.
+  def fetch!
+    pipelines = @client.merge_request_pipelines(@project, @mr_iid)
+    @pipeline = pipelines.find { |p| p.sha == @head_sha }
+    return false unless @pipeline
+
+    @jobs = @client.pipeline_jobs(@project, @pipeline.id, per_page: 100)
+    @failed_jobs = @jobs.select { |j| j.status == "failed" }
+
+    if @failed_jobs.any?
+      log_dir = File.join(@repo_path, ".pipeline_logs")
+      FileUtils.mkdir_p(log_dir)
+
+      @failed_jobs.each do |job|
+        trace = @client.job_trace(@project, job.id)
+        log_path = File.join(log_dir, "job_#{job.id}_#{sanitize(job.name)}.log")
+        File.write(log_path, trace)
+      rescue Gitlab::Error::ResponseError => e
+        warn "  ⚠ Could not fetch log for job #{job.name} (##{job.id}): #{e.message}"
+      end
+    end
+
+    true
+  rescue Gitlab::Error::ResponseError => e
+    warn "  ⚠ Pipeline fetch failed: #{e.message}"
+    false
+  end
+
+  # Returns a string to inject into the Claude prompt, or empty string if no pipeline.
+  def prompt_section
+    return "" unless @pipeline
+
+    lines = []
+    lines << "## Pipeline CI (SHA #{@head_sha[0, 8]})"
+    lines << ""
+    lines << "Pipeline ##{@pipeline.id} — status: **#{@pipeline.status}**"
+    lines << ""
+    lines << "| Job | Stage | Status |"
+    lines << "|-----|-------|--------|"
+    @jobs.each do |j|
+      lines << "| #{j.name} | #{j.stage} | #{j.status} |"
+    end
+    lines << ""
+
+    if @failed_jobs.any?
+      lines << "### Failed job logs"
+      lines << ""
+      lines << "The following jobs have failed. Their logs are saved in `.pipeline_logs/`."
+      lines << "Use **sub-agents** (Agent tool) to read each log file — do NOT read them directly"
+      lines << "to avoid overflowing your context window."
+      lines << ""
+      @failed_jobs.each do |job|
+        log_path = ".pipeline_logs/job_#{job.id}_#{sanitize(job.name)}.log"
+        lines << "- **#{job.name}** (stage: #{job.stage}): `#{log_path}`"
+      end
+      lines << ""
+    end
+
+    lines.join("\n")
+  end
+
+  # Returns a step instruction for the prompt, or empty string if no pipeline.
+  def prompt_step
+    return "" unless @pipeline
+    "\n  6. Analyse the CI pipeline data provided below. " \
+    "If there are failed jobs, use **sub-agents** to read the log files in `.pipeline_logs/` " \
+    "and correlate failures with the MR diff changes. Include your analysis in `pipeline_summary`."
+  end
+
+  private
+
+  def sanitize(name)
+    name.gsub(/[^a-zA-Z0-9_-]/, "_")[0, 60]
+  end
+end
+
 # ── Claude Code runner ────────────────────────────────────────────────────────
 
 REVIEW_PROMPT = <<~PROMPT
@@ -443,7 +537,7 @@ REVIEW_PROMPT = <<~PROMPT
   3. For each changed file, read its full content when context beyond the diff is needed.
   4. Read `CLAUDE.md` (if it exists) and any referenced skill or convention files.
   5. Check the MR commit messages (`git log origin/%<target>s..HEAD --oneline`) for context
-     and for whether previous review comments (if any) have been addressed.
+     and for whether previous review comments (if any) have been addressed.%<pipeline_step>s
 
   ## Review criteria (in priority order)
 
@@ -455,7 +549,7 @@ REVIEW_PROMPT = <<~PROMPT
   - **Project conventions** – anything mandated by CLAUDE.md or referenced skill files
   - **Test coverage** – missing or inadequate tests for the changes
 
-  ## Output format
+  %<pipeline_section>s## Output format
 
   Respond with **only** a valid JSON object. No markdown fences, no preamble, no explanation.
 
@@ -463,6 +557,7 @@ REVIEW_PROMPT = <<~PROMPT
   {
     "summary": "<markdown: overall assessment, 3-10 sentences>",
     "verdict": "approve" | "request_changes",
+    "pipeline_summary": "<markdown: pipeline analysis — only if pipeline data is provided>",
     "comments": [
       {
         "file": "<relative file path from repo root>",
@@ -477,7 +572,7 @@ REVIEW_PROMPT = <<~PROMPT
 
   ## Language
 
-  - **All `body` fields and the `summary` must be written in French.**
+  - **All `body` fields, the `summary`, and the `pipeline_summary` must be written in French.**
   - The JSON keys and enum values (`verdict`, `severity`, `category`, etc.) stay in English.
 
   ## Constraints
@@ -487,6 +582,7 @@ REVIEW_PROMPT = <<~PROMPT
   - Line numbers must correspond to the **new** version of the file after the MR changes.
   - Omit trivial nitpicks unless they violate a rule in CLAUDE.md.
   - The `comments` array may be empty only when `verdict` is `"approve"`.
+  - Produce `pipeline_summary` **only** when pipeline CI data is provided above. Omit the key entirely otherwise.
 PROMPT
 
 REVIEW_JSON_SCHEMA = {
@@ -496,6 +592,7 @@ REVIEW_JSON_SCHEMA = {
   properties: {
     summary: { type: "string", description: "Overall assessment in French, 3-10 sentences, markdown" },
     verdict: { type: "string", enum: %w[approve request_changes] },
+    pipeline_summary: { type: "string", description: "Pipeline analysis in French, markdown. Only present when pipeline data is provided." },
     comments: {
       type: "array",
       items: {
@@ -514,8 +611,10 @@ REVIEW_JSON_SCHEMA = {
   }
 }.freeze
 
-def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:, repo_path:)
-  prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch)
+def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:, repo_path:,
+                      pipeline_section: "", pipeline_step: "")
+  prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch,
+                                 pipeline_section: pipeline_section, pipeline_step: pipeline_step)
 
   raw_output = nil
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -662,12 +761,10 @@ module DraftState
     ".mr_review_draft_#{mr_iid}.json"
   end
 
-  def self.save(mr_iid, comments:, summary:, verdict:, sha:)
-    File.write(
-      path(mr_iid),
-      JSON.pretty_generate(comments: comments, summary: summary,
-                           verdict: verdict, sha: sha)
-    )
+  def self.save(mr_iid, comments:, summary:, verdict:, sha:, pipeline_summary: nil)
+    data = { comments: comments, summary: summary, verdict: verdict, sha: sha }
+    data[:pipeline_summary] = pipeline_summary if pipeline_summary
+    File.write(path(mr_iid), JSON.pretty_generate(data))
   end
 
   def self.load(mr_iid)
@@ -721,7 +818,8 @@ class ReviewSubmitter
   # Creates draft notes (inline + summary), publishes them in one batch,
   # then approves the MR if verdict is "approve".
   # Raises ApiError on any unrecoverable GitLab error.
-  def submit(comments:, summary:, verdict:, sha:, gitlab_client:, is_re_review: false)
+  def submit(comments:, summary:, verdict:, sha:, gitlab_client:, is_re_review: false,
+             pipeline_summary: nil)
     delete_stale_drafts!
 
     inline_errors = []
@@ -741,6 +839,10 @@ class ReviewSubmitter
       create_draft_note(marker)
     else
       create_draft_note(":mag: **Code Review**\n\n#{summary}\n\n#{marker}")
+    end
+
+    if pipeline_summary && !pipeline_summary.strip.empty?
+      create_draft_note(":construction: **Pipeline**\n\n#{pipeline_summary}")
     end
 
     publish_all_drafts!
@@ -923,8 +1025,9 @@ def main
       { "file" => c[:file], "line" => c[:line], "severity" => c[:severity],
         "category" => c[:category], "body" => c[:body] }
     end
-    final_summary = prev[:summary]
-    final_verdict = prev[:verdict]
+    final_summary    = prev[:summary]
+    final_verdict    = prev[:verdict]
+    pipeline_summary = prev[:pipeline_summary]
 
     puts pastel.cyan("  Republishing review ##{prev[:id]} (#{prev[:head_sha][0, 8]}, #{approved_comments.size} comment(s))")
 
@@ -935,7 +1038,8 @@ def main
     )
     submitter.submit(
       comments: approved_comments, summary: final_summary,
-      verdict: final_verdict, sha: mr.sha, gitlab_client: client
+      verdict: final_verdict, sha: mr.sha, gitlab_client: client,
+      pipeline_summary: pipeline_summary
     )
     puts pastel.bold.green("\n  ✅ Review republished (#{final_verdict.gsub("_", " ")}).")
     exit 0
@@ -971,6 +1075,7 @@ def main
   final_summary     = nil
   final_verdict     = nil
   total_comments    = nil
+  pipeline_summary  = nil
 
   db_draft = Database.find_validated_review(project, mr_iid, mr.sha)
   if db_draft
@@ -981,9 +1086,10 @@ def main
         { "file" => c[:file], "line" => c[:line], "severity" => c[:severity],
           "category" => c[:category], "body" => c[:body] }
       end
-      final_summary  = db_draft[:summary]
-      final_verdict  = db_draft[:verdict]
-      total_comments = db_draft[:comments_total]
+      final_summary    = db_draft[:summary]
+      final_verdict    = db_draft[:verdict]
+      total_comments   = db_draft[:comments_total]
+      pipeline_summary = db_draft[:pipeline_summary]
       # Reuse existing review row
       review_id = db_draft[:id]
       puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from DB.")
@@ -998,6 +1104,7 @@ def main
         approved_comments = file_draft["comments"]
         final_summary     = file_draft["summary"]
         final_verdict     = file_draft["verdict"]
+        pipeline_summary  = file_draft["pipeline_summary"]
         total_comments    = approved_comments.size
         puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from draft file.")
       end
@@ -1019,6 +1126,18 @@ def main
     repo_mgr.setup!
     puts pastel.green("  ✓ Cloned into #{repo_mgr.repo_path}")
 
+    # 7b. Fetch CI pipeline
+    current_phase = "pipeline"
+    pf = PipelineFetcher.new(
+      client: client, project: project, mr_iid: mr_iid,
+      head_sha: mr.sha, repo_path: repo_mgr.repo_path
+    )
+    if pf.fetch!
+      puts pastel.green("  ✓ Pipeline ##{pf.pipeline.id} (#{pf.pipeline.status}) — #{pf.jobs.size} job(s), #{pf.failed_jobs.size} failed")
+    else
+      puts pastel.dim("  ℹ No pipeline found for HEAD SHA #{mr.sha[0, 8]}")
+    end
+
     # 8. Run Claude Code review
     current_phase = "claude"
     Database.update_review(review_id, status: "reviewing")
@@ -1026,7 +1145,9 @@ def main
 
     result   = run_claude_review(mr.target_branch, mr.source_branch,
                                  claude_bin: claude_bin, claude_timeout: claude_timeout,
-                                 repo_path: repo_mgr.repo_path)
+                                 repo_path: repo_mgr.repo_path,
+                                 pipeline_section: pf.prompt_section,
+                                 pipeline_step: pf.prompt_step)
     review   = result["review"]
     duration = result["duration"]
 
@@ -1057,17 +1178,19 @@ def main
 
     approved_comments = all_comments.reject { |c| c["_review_status"] == "skipped" }
 
-    has_blocking  = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
-    final_verdict = has_blocking ? "request_changes" : review["verdict"]
-    final_summary = review["summary"]
+    has_blocking     = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
+    final_verdict    = has_blocking ? "request_changes" : review["verdict"]
+    final_summary    = review["summary"]
+    pipeline_summary = review["pipeline_summary"]
 
     # 10. UPDATE status: validated
     Database.update_review(review_id,
-      status:         "validated",
-      verdict:        final_verdict,
-      summary:        final_summary,
-      comments_total: total_comments,
-      comments_kept:  approved_comments.size
+      status:           "validated",
+      verdict:          final_verdict,
+      summary:          final_summary,
+      pipeline_summary: pipeline_summary,
+      comments_total:   total_comments,
+      comments_kept:    approved_comments.size
     )
   end
 
@@ -1078,6 +1201,13 @@ def main
     puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
     puts final_summary
     puts
+
+    if pipeline_summary && !pipeline_summary.strip.empty?
+      puts pastel.bold.cyan("── Pipeline ─────────────────────────────────────────────────")
+      puts pipeline_summary
+      puts
+    end
+
     puts "  Inline comments : #{approved_comments.size} / #{total_comments} kept"
 
     verdict_display = if final_verdict == "approve"
@@ -1088,7 +1218,11 @@ def main
     puts "  Verdict         : #{verdict_display}"
     puts
 
-    action = tty.select("Action?", ["Submit", "Edit summary", "Cancel"], cycle: true)
+    menu_choices = ["Submit", "Edit summary"]
+    menu_choices << "Edit pipeline summary" if pipeline_summary && !pipeline_summary.strip.empty?
+    menu_choices << "Cancel"
+
+    action = tty.select("Action?", menu_choices, cycle: true)
 
     case action
     when "Edit summary"
@@ -1103,6 +1237,18 @@ def main
         final_summary = edited
         Database.update_review(review_id, summary: final_summary)
       end
+    when "Edit pipeline summary"
+      edited = nil
+      Tempfile.create(["mr_pipeline", ".md"]) do |f|
+        f.write(pipeline_summary)
+        f.flush
+        TTY::Editor.open(f.path)
+        edited = File.read(f.path).strip
+      end
+      if edited && !edited.empty?
+        pipeline_summary = edited
+        Database.update_review(review_id, pipeline_summary: pipeline_summary)
+      end
     when "Cancel"
       Database.update_review(review_id, status: "cancelled", finished_at: Sequel.function(:now))
       puts pastel.yellow("  Review cancelled. Nothing was submitted.")
@@ -1116,10 +1262,11 @@ def main
   current_phase = "submit"
   unless Database.connected?
     DraftState.save(mr_iid,
-      comments: approved_comments,
-      summary:  final_summary,
-      verdict:  final_verdict,
-      sha:      mr.sha
+      comments:         approved_comments,
+      summary:          final_summary,
+      verdict:          final_verdict,
+      sha:              mr.sha,
+      pipeline_summary: pipeline_summary
     )
     puts pastel.dim("  Draft saved to #{DraftState.path(mr_iid)}")
   end
@@ -1136,12 +1283,13 @@ def main
   )
 
   submitter.submit(
-    comments:       approved_comments,
-    summary:        final_summary,
-    verdict:        final_verdict,
-    sha:            mr.sha,
-    gitlab_client:  client,
-    is_re_review:   !!reviewed_sha
+    comments:         approved_comments,
+    summary:          final_summary,
+    verdict:          final_verdict,
+    sha:              mr.sha,
+    gitlab_client:    client,
+    is_re_review:     !!reviewed_sha,
+    pipeline_summary: pipeline_summary
   )
 
   # 14. UPDATE status: submitted
