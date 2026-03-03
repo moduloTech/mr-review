@@ -713,7 +713,8 @@ class ReviewSubmitter
     @token       = token
     @mr_iid      = mr_iid
     @diff_refs   = diff_refs
-    @enc_project = CGI.escape(project_id.to_s)
+    @project_id  = project_id.to_s
+    @enc_project = CGI.escape(@project_id)
     @api_root    = "#{base_url}/api/v4"
   end
 
@@ -744,7 +745,7 @@ class ReviewSubmitter
 
     publish_all_drafts!
 
-    gitlab_client.approve_merge_request(@enc_project, @mr_iid) if verdict == "approve"
+    gitlab_client.approve_merge_request(@project_id, @mr_iid) if verdict == "approve"
   end
 
   private
