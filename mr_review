@@ -720,7 +720,7 @@ class ReviewSubmitter
   # Creates draft notes (inline + summary), publishes them in one batch,
   # then approves the MR if verdict is "approve".
   # Raises ApiError on any unrecoverable GitLab error.
-  def submit(comments:, summary:, verdict:, sha:, gitlab_client:)
+  def submit(comments:, summary:, verdict:, sha:, gitlab_client:, is_re_review: false)
     delete_stale_drafts!
 
     inline_errors = []
@@ -736,7 +736,11 @@ class ReviewSubmitter
     end
 
     marker = "#{REVIEW_MARKER_TAG}#{sha} -->"
-    create_draft_note(":mag: **Code Review**\n\n#{summary}\n\n#{marker}")
+    if is_re_review
+      create_draft_note(marker)
+    else
+      create_draft_note(":mag: **Code Review**\n\n#{summary}\n\n#{marker}")
+    end
 
     publish_all_drafts!
 
@@ -1135,7 +1139,8 @@ def main
     summary:        final_summary,
     verdict:        final_verdict,
     sha:            mr.sha,
-    gitlab_client:  client
+    gitlab_client:  client,
+    is_re_review:   !!reviewed_sha
   )
 
   # 14. UPDATE status: submitted
