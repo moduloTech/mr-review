@@ -311,13 +311,13 @@ module Database
     ).order(Sequel.desc(:id)).first
   end
 
-  def self.find_submitted_review(project_path, mr_iid)
+  def self.find_republishable_review(project_path, mr_iid)
     return nil unless connected?
     @db[:reviews].where(
       project_path: project_path,
       mr_iid:       mr_iid,
-      status:       "submitted"
-    ).order(Sequel.desc(:id)).first
+      status:       %w[submitted validated error]
+    ).exclude(comments_kept: [nil, 0]).order(Sequel.desc(:id)).first
   end
 
   def self.last_reviewed_sha(project_path, mr_iid)
@@ -915,8 +915,8 @@ def main
     current_phase = "republish"
     raise MrReviewError, "Republish requires a database connection (-d or DATABASE_URL)" unless Database.connected?
 
-    prev = Database.find_submitted_review(project, mr_iid)
-    raise MrReviewError, "No submitted review found for #{project} !#{mr_iid}" unless prev
+    prev = Database.find_republishable_review(project, mr_iid)
+    raise MrReviewError, "No review with comments found for #{project} !#{mr_iid}" unless prev
 
     db_comments       = Database.comments_for_review(prev[:id])
     approved_comments = db_comments.select { |c| c[:status] != "skipped" }.map do |c|
