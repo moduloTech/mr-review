@@ -41,6 +41,7 @@ require "net/https"
 require "open3"
 require "optparse"
 require "shellwords"
+require "fileutils"
 require "tempfile"
 require "timeout"
 require "uri"
@@ -56,7 +57,6 @@ class ClaudeParseError < ClaudeError; end
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-REVIEW_BRANCH_PREFIX = "review/mr-"
 REVIEW_MARKER_TAG    = "<!-- mr-reviewer-sha:"
 CONTEXT_LINES        = 4
 
@@ -396,50 +396,35 @@ def last_reviewed_sha(client, project_id, mr_iid)
   nil
 end
 
-# ── Branch management ─────────────────────────────────────────────────────────
+# ── Repository management (clone into /tmp) ───────────────────────────────────
 
-class BranchManager
-  attr_reader :review_branch
+class RepoManager
+  attr_reader :repo_path
 
-  def initialize(source_branch, mr_iid)
-    @source_branch   = source_branch
-    @review_branch   = "#{REVIEW_BRANCH_PREFIX}#{mr_iid}"
-    @original_branch = current_branch
+  def initialize(base_url:, project_path:, source_branch:, mr_iid:, token:)
+    uri = URI.parse(base_url)
+    host_port = uri.port && ![80, 443].include?(uri.port) ? "#{uri.host}:#{uri.port}" : uri.host
+    @clone_url     = "#{uri.scheme}://oauth2:#{token}@#{host_port}/#{project_path}.git"
+    @source_branch = source_branch
+    @repo_path     = File.join("/tmp", "mr_review_#{mr_iid}_#{Process.pid}")
   end
 
   def setup!
-    # If we're already on the review branch (leftover from a previous interrupted run),
-    # switch away first so the fetch can update it.
-    if @original_branch == @review_branch
-      default = detect_default_branch
-      git! "checkout #{default}"
-      @original_branch = default
-    end
-    git! "fetch origin #{@source_branch}:#{@review_branch} --force --no-tags"
-    git! "checkout #{@review_branch}"
+    FileUtils.rm_rf(@repo_path) if Dir.exist?(@repo_path)
+    git! "clone --branch #{Shellwords.escape(@source_branch)} " \
+         "#{Shellwords.escape(@clone_url)} #{Shellwords.escape(@repo_path)}"
   end
 
   def teardown!
-    git! "checkout #{@original_branch}"
-    system("git branch -D #{@review_branch} 2>/dev/null")
+    FileUtils.rm_rf(@repo_path) if @repo_path && Dir.exist?(@repo_path)
   end
 
   private
 
-  def current_branch
-    branch = `git rev-parse --abbrev-ref HEAD 2>/dev/null`.strip
-    raise MrReviewError, "Not inside a git repository (or HEAD is detached)" if branch.empty? || branch == "HEAD"
-    branch
-  end
-
-  def detect_default_branch
-    ref = `git symbolic-ref refs/remotes/origin/HEAD 2>/dev/null`.strip
-    ref.empty? ? "main" : ref.sub("refs/remotes/origin/", "")
-  end
-
   def git!(cmd)
     out, status = Open3.capture2e("git #{cmd}")
-    raise MrReviewError, "git #{cmd}\n  failed: #{out.strip}" unless status.success?
+    # Mask the token in error messages
+    raise MrReviewError, "git #{cmd.gsub(/oauth2:[^@]+@/, 'oauth2:****@')}\n  failed: #{out.strip}" unless status.success?
   end
 end
 
@@ -449,15 +434,15 @@ REVIEW_PROMPT = <<~PROMPT
   You are performing a thorough code review of a GitLab Merge Request.
 
   The repository is already checked out on the MR source branch (%<review_branch>s).
-  The merge target branch is: `%<target>s`.
+  The merge target branch is: `origin/%<target>s`.
 
   ## Steps
 
-  1. Run `git diff %<target>s...HEAD --stat` to list changed files.
-  2. Run `git diff %<target>s...HEAD` to read the full diff.
+  1. Run `git diff origin/%<target>s...HEAD --stat` to list changed files.
+  2. Run `git diff origin/%<target>s...HEAD` to read the full diff.
   3. For each changed file, read its full content when context beyond the diff is needed.
   4. Read `CLAUDE.md` (if it exists) and any referenced skill or convention files.
-  5. Check the MR commit messages (`git log %<target>s..HEAD --oneline`) for context
+  5. Check the MR commit messages (`git log origin/%<target>s..HEAD --oneline`) for context
      and for whether previous review comments (if any) have been addressed.
 
   ## Review criteria (in priority order)
@@ -529,7 +514,7 @@ REVIEW_JSON_SCHEMA = {
   }
 }.freeze
 
-def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:)
+def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:, repo_path:)
   prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch)
 
   raw_output = nil
@@ -541,7 +526,7 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
     # Write output to a temp file to avoid pipe buffer truncation on large reviews.
     Tempfile.create(["claude_review", ".txt"]) do |f|
       f.close
-      system("#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json} > #{Shellwords.escape(f.path)} 2>&1")
+      system("#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
       unless $CHILD_STATUS.success?
         raise ClaudeError, "#{claude_bin} -p exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
       end
@@ -573,10 +558,11 @@ end
 # ── Interactive comment validator ─────────────────────────────────────────────
 
 class CommentValidator
-  def initialize(comments, pastel:, prompt:)
-    @comments = comments
-    @pastel   = pastel
-    @prompt   = prompt
+  def initialize(comments, pastel:, prompt:, repo_path: ".")
+    @comments  = comments
+    @pastel    = pastel
+    @prompt    = prompt
+    @repo_path = repo_path
   end
 
   # Returns ALL comments (accepted, edited, and skipped) with tracking metadata:
@@ -637,9 +623,10 @@ class CommentValidator
   end
 
   def file_context(path, target_line)
-    return @pastel.dim("  (file not found on disk)") unless File.exist?(path)
+    full_path = File.join(@repo_path, path)
+    return @pastel.dim("  (file not found on disk)") unless File.exist?(full_path)
 
-    lines = File.readlines(path)
+    lines = File.readlines(full_path)
     from  = [target_line - CONTEXT_LINES - 1, 0].max
     to    = [target_line + CONTEXT_LINES - 1, lines.size - 1].min
 
@@ -886,7 +873,7 @@ def main
 
   current_phase = "arg_parse"
   review_id     = nil
-  branch_mgr    = nil
+  repo_mgr      = nil
 
   puts pastel.bold.blue("╔═ MR Reviewer ═══════════════════════════════════════╗")
 
@@ -1013,20 +1000,28 @@ def main
   end
 
   unless approved_comments
-    # 7. Checkout source branch
-    current_phase = "checkout"
-    branch_mgr = BranchManager.new(mr.source_branch, mr_iid)
-    at_exit { branch_mgr&.teardown! }
-    branch_mgr.setup!
-    puts pastel.green("  ✓ Checked out #{branch_mgr.review_branch}")
+    # 7. Clone repository into /tmp
+    current_phase = "clone"
+    clone_base_url = args[:base_url] || "https://#{URI.parse(client.endpoint).host}"
+    repo_mgr = RepoManager.new(
+      base_url:      clone_base_url,
+      project_path:  project,
+      source_branch: mr.source_branch,
+      mr_iid:        mr_iid,
+      token:         token
+    )
+    at_exit { repo_mgr&.teardown! }
+    repo_mgr.setup!
+    puts pastel.green("  ✓ Cloned into #{repo_mgr.repo_path}")
 
     # 8. Run Claude Code review
     current_phase = "claude"
     Database.update_review(review_id, status: "reviewing")
     puts pastel.bold("\n  ⏳ Running Claude Code review (timeout: #{claude_timeout}s)…")
 
-    result   = run_claude_review(mr.target_branch, branch_mgr.review_branch,
-                                 claude_bin: claude_bin, claude_timeout: claude_timeout)
+    result   = run_claude_review(mr.target_branch, mr.source_branch,
+                                 claude_bin: claude_bin, claude_timeout: claude_timeout,
+                                 repo_path: repo_mgr.repo_path)
     review   = result["review"]
     duration = result["duration"]
 
@@ -1037,7 +1032,7 @@ def main
 
     # 9. Interactive comment validation
     current_phase = "validate"
-    validator     = CommentValidator.new(review["comments"], pastel: pastel, prompt: tty)
+    validator     = CommentValidator.new(review["comments"], pastel: pastel, prompt: tty, repo_path: repo_mgr.repo_path)
     all_comments  = validator.run
 
     # Insert all comments into DB
