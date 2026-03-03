@@ -1,0 +1,603 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# =============================================================================
+# mr_reviewer.rb
+#
+# Automated GitLab Merge Request review via Claude Code.
+# Fetches the MR diff, runs Claude Code in review mode, presents each comment
+# for interactive validation, then submits a single batch review (draft notes)
+# and approves or requests changes accordingly.
+#
+# Usage:
+#   ruby mr_reviewer.rb <MR_URL>
+#   ruby mr_reviewer.rb <PROJECT_PATH_OR_ID> <MR_IID>
+#
+#   MR_URL example:
+#     https://source.modulotech.fr/modulosource/ff/fast/core/-/merge_requests/687
+#
+# Environment:
+#   GITLAB_API_TOKEN   Personal Access Token with api scope (required)
+#   CLAUDE_BIN         Path to claude binary (default: "claude")
+#   CLAUDE_TIMEOUT     Review timeout in seconds (default: 360)
+# =============================================================================
+
+require "bundler/inline"
+
+gemfile(true) do
+  source "https://rubygems.org"
+  gem "gitlab",     "~> 5.0"
+  gem "tty-prompt", "~> 0.23"
+  gem "tty-editor", "~> 0.7"
+  gem "pastel",     "~> 0.8"
+end
+
+require "cgi"
+require "json"
+require "net/http"
+require "net/https"
+require "open3"
+require "shellwords"
+require "tempfile"
+require "timeout"
+require "uri"
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+REVIEW_BRANCH_PREFIX = "review/mr-"
+REVIEW_MARKER_TAG    = "<!-- mr-reviewer-sha:"
+CONTEXT_LINES        = 4
+CLAUDE_BIN           = ENV.fetch("CLAUDE_BIN", "claude")
+CLAUDE_TIMEOUT_SEC   = ENV.fetch("CLAUDE_TIMEOUT", "360").to_i
+
+# ── Argument parsing ──────────────────────────────────────────────────────────
+
+def parse_args(argv)
+  case argv.size
+  when 1
+    uri   = URI.parse(argv.first)
+    abort "Expected an http(s) URL" unless %w[http https].include?(uri.scheme)
+
+    base_url, _, mr_segment = uri.path.partition("/-/merge_requests/")
+    abort "URL does not look like a GitLab MR URL" if mr_segment.empty?
+
+    {
+      base_url:     "#{uri.scheme}://#{uri.host}",
+      project_path: base_url.delete_prefix("/"),
+      mr_iid:       mr_segment.split("/").first.to_i
+    }
+  when 2
+    { base_url: nil, project_path: argv[0], mr_iid: argv[1].to_i }
+  else
+    abort "Usage:\n  mr_reviewer.rb <MR_URL>\n  mr_reviewer.rb <PROJECT_PATH> <MR_IID>"
+  end
+end
+
+# ── GitLab helpers ────────────────────────────────────────────────────────────
+
+def build_client(base_url)
+  token = ENV.fetch("GITLAB_API_TOKEN") { abort "Missing GITLAB_API_TOKEN env var" }
+  opts  = { private_token: token }
+  opts[:endpoint] = "#{base_url}/api/v4" if base_url
+  Gitlab.client(**opts)
+end
+
+# URL-encode a project path so slashes become %2F for the REST API path segment.
+def encode_project(path_or_id)
+  CGI.escape(path_or_id.to_s)
+end
+
+# ── Idempotence check ─────────────────────────────────────────────────────────
+
+# Returns the SHA that was reviewed in the most recent bot note, or nil.
+def last_reviewed_sha(client, project_id, mr_iid)
+  page = 1
+  loop do
+    notes = client.merge_request_notes(project_id, mr_iid,
+                                       sort: "desc", page: page, per_page: 100)
+    return nil if notes.empty?
+
+    notes.each do |note|
+      if (m = note.body.to_s.match(/#{Regexp.escape(REVIEW_MARKER_TAG)}([0-9a-f]{40})/))
+        return m[1]
+      end
+    end
+
+    break if notes.size < 100
+    page += 1
+  end
+  nil
+end
+
+# ── Branch management ─────────────────────────────────────────────────────────
+
+class BranchManager
+  attr_reader :review_branch
+
+  def initialize(source_branch, mr_iid)
+    @source_branch   = source_branch
+    @review_branch   = "#{REVIEW_BRANCH_PREFIX}#{mr_iid}"
+    @original_branch = current_branch
+  end
+
+  def setup!
+    git! "fetch origin #{@source_branch}:#{@review_branch} --force --no-tags"
+    git! "checkout #{@review_branch}"
+  end
+
+  def teardown!
+    git! "checkout #{@original_branch}"
+    system("git branch -D #{@review_branch} 2>/dev/null")
+  end
+
+  private
+
+  def current_branch
+    branch = `git rev-parse --abbrev-ref HEAD 2>/dev/null`.strip
+    abort "Not inside a git repository (or HEAD is detached)" if branch.empty? || branch == "HEAD"
+    branch
+  end
+
+  def git!(cmd)
+    out, status = Open3.capture2e("git #{cmd}")
+    abort "git #{cmd}\n  failed: #{out.strip}" unless status.success?
+  end
+end
+
+# ── Claude Code runner ────────────────────────────────────────────────────────
+
+REVIEW_PROMPT = <<~PROMPT
+  You are performing a thorough code review of a GitLab Merge Request.
+
+  The repository is already checked out on the MR source branch (%<review_branch>s).
+  The merge target branch is: `%<target>s`.
+
+  ## Steps
+
+  1. Run `git diff %<target>s...HEAD --stat` to list changed files.
+  2. Run `git diff %<target>s...HEAD` to read the full diff.
+  3. For each changed file, read its full content when context beyond the diff is needed.
+  4. Read `CLAUDE.md` (if it exists) and any referenced skill or convention files.
+  5. Check the MR commit messages (`git log %<target>s..HEAD --oneline`) for context
+     and for whether previous review comments (if any) have been addressed.
+
+  ## Review criteria (in priority order)
+
+  - **Bugs** – logic errors, wrong conditions, unhandled edge cases, nil-safety
+  - **Security** – SQL injection, mass assignment, auth bypass, insecure storage, XSS, SSRF
+  - **Business logic** – incorrect domain behaviour, race conditions, state machine issues
+  - **Performance** – N+1 queries, missing DB indexes, unbounded queries, memory leaks
+  - **Ruby idiom & style** – readability, idiomatic patterns, unnecessary complexity
+  - **Project conventions** – anything mandated by CLAUDE.md or referenced skill files
+  - **Test coverage** – missing or inadequate tests for the changes
+
+  ## Output format
+
+  Respond with **only** a valid JSON object. No markdown fences, no preamble, no explanation.
+
+  ```
+  {
+    "summary": "<markdown: overall assessment, 3-10 sentences>",
+    "verdict": "approve" | "request_changes",
+    "comments": [
+      {
+        "file": "<relative file path from repo root>",
+        "line": <integer — line number in the NEW version of the file>,
+        "severity": "error" | "warning" | "info" | "nitpick",
+        "category": "bug" | "security" | "logic" | "performance" | "style" | "test" | "other",
+        "body": "<markdown comment>"
+      }
+    ]
+  }
+  ```
+
+  ## Language
+
+  - **All `body` fields and the `summary` must be written in French.**
+  - The JSON keys and enum values (`verdict`, `severity`, `category`, etc.) stay in English.
+
+  ## Constraints
+
+  - `verdict` must be `"approve"` only when there are **zero** `"error"` or `"warning"` comments.
+  - Only comment on lines that are part of the diff (added lines or immediate context).
+  - Line numbers must correspond to the **new** version of the file after the MR changes.
+  - Omit trivial nitpicks unless they violate a rule in CLAUDE.md.
+  - The `comments` array may be empty only when `verdict` is `"approve"`.
+PROMPT
+
+def run_claude_review(target_branch, review_branch)
+  prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch)
+
+  raw_output = nil
+  Timeout.timeout(CLAUDE_TIMEOUT_SEC) do
+    # Write output to a temp file to avoid pipe buffer truncation on large reviews.
+    Tempfile.create(["claude_review", ".txt"]) do |f|
+      f.close
+      system("#{CLAUDE_BIN} -p #{Shellwords.escape(prompt)} > #{Shellwords.escape(f.path)} 2>&1")
+      unless $CHILD_STATUS.success?
+        abort "#{CLAUDE_BIN} -p exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
+      end
+      raw_output = File.read(f.path)
+    end
+  end
+
+  # Claude Code sometimes emits prose before/after the JSON, and/or wraps it in
+  # a markdown code fence.  Try strategies in order:
+  #   1. First ```json ... ``` or ``` ... ``` block
+  #   2. First top-level JSON object { ... } in the output
+  #   3. Raw output as-is (will raise JSON::ParserError with useful context)
+  json_str = if (m = raw_output.match(/```(?:json)?\s*\n(.*?)```/m))
+    m[1].strip
+  elsif (m = raw_output.match(/(\{.*\})/m))
+    m[1].strip
+  else
+    raw_output.strip
+  end
+
+  JSON.parse(json_str)
+rescue Timeout::Error
+  abort "Claude Code timed out after #{CLAUDE_TIMEOUT_SEC}s. Try increasing CLAUDE_TIMEOUT."
+rescue JSON::ParserError => e
+  abort "Claude returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output}"
+end
+
+# ── Interactive comment validator ─────────────────────────────────────────────
+
+class CommentValidator
+  def initialize(comments, pastel:, prompt:)
+    @comments = comments
+    @pastel   = pastel
+    @prompt   = prompt
+  end
+
+  # Returns the list of accepted (and possibly edited) comments.
+  def run
+    return [] if @comments.empty?
+
+    puts @pastel.bold.cyan("\n── Reviewing #{@comments.size} comment(s) ───────────────────────")
+
+    @comments.each_with_object([]) do |comment, accepted|
+      render_comment(comment, accepted.size + 1)
+
+      action = @prompt.select(
+        "Action?",
+        [ "Accept", "Edit", "Skip" ],
+        cycle: true,
+        per_page: 3
+      )
+
+      case action
+      when "Accept"
+        accepted << comment
+      when "Edit"
+        edited_body = edit_in_editor(comment["body"])
+        accepted << comment.merge("body" => edited_body) if edited_body&.strip&.length&.positive?
+      when "Skip"
+        # discard
+      end
+    end
+  end
+
+  private
+
+  def render_comment(comment, index)
+    system("clear") || system("cls")
+    c = @pastel
+
+    puts c.bold.cyan("── Comment #{index}/#{@comments.size} " + "─" * 40)
+    puts "  #{c.bold(comment["file"])}:#{c.bold(comment["line"].to_s)}"
+    puts "  #{c.yellow("[#{comment["severity"].upcase}]")} #{c.dim(comment["category"])}"
+    puts c.dim("─" * 60)
+
+    puts c.bold("\nFile context:")
+    puts file_context(comment["file"], comment["line"].to_i)
+
+    puts c.bold("\nComment:")
+    puts comment["body"]
+    puts
+  end
+
+  def file_context(path, target_line)
+    return @pastel.dim("  (file not found on disk)") unless File.exist?(path)
+
+    lines = File.readlines(path)
+    from  = [target_line - CONTEXT_LINES - 1, 0].max
+    to    = [target_line + CONTEXT_LINES - 1, lines.size - 1].min
+
+    lines[from..to].each_with_index.map do |text, i|
+      lineno  = from + i + 1
+      current = lineno == target_line
+      prefix  = current ? @pastel.red.bold("▶ ") : "  "
+      num     = @pastel.dim(lineno.to_s.rjust(5))
+      body    = current ? @pastel.bold(text.chomp) : text.chomp
+      "#{prefix}#{num}  #{body}"
+    end.join("\n")
+  end
+
+  def edit_in_editor(initial_text)
+    Tempfile.create(["mr_comment", ".md"]) do |f|
+      f.write(initial_text)
+      f.flush
+      TTY::Editor.open(f.path)
+      File.read(f.path)
+    end
+  end
+end
+
+# ── Draft state persistence ───────────────────────────────────────────────────
+#
+# Before any GitLab API call, the validated review is saved to a local JSON
+# file.  This allows resuming after a network or server error without losing
+# the edits made during interactive validation.
+# The file is deleted automatically on successful submission.
+
+module DraftState
+  def self.path(mr_iid)
+    ".mr_review_draft_#{mr_iid}.json"
+  end
+
+  def self.save(mr_iid, comments:, summary:, verdict:, sha:)
+    File.write(
+      path(mr_iid),
+      JSON.pretty_generate(comments: comments, summary: summary,
+                           verdict: verdict, sha: sha)
+    )
+  end
+
+  def self.load(mr_iid)
+    file = path(mr_iid)
+    return nil unless File.exist?(file)
+    JSON.parse(File.read(file))
+  end
+
+  def self.delete(mr_iid)
+    File.delete(path(mr_iid)) if File.exist?(path(mr_iid))
+  end
+end
+
+# ── GitLab draft-notes submitter ──────────────────────────────────────────────
+#
+# The `gitlab` gem does not expose draft notes endpoints and does not support
+# sending nested JSON bodies for arbitrary paths, so we use Net::HTTP directly.
+
+class ReviewSubmitter
+  # Raised when the GitLab API returns an unexpected HTTP status.
+  class ApiError < StandardError
+    attr_reader :status, :body
+
+    def initialize(status, body)
+      @status = status
+      @body   = body
+      super("HTTP #{status}")
+    end
+
+    def detail
+      parsed = JSON.parse(@body) rescue nil
+      if parsed.is_a?(Hash) && parsed["message"]
+        parsed["message"].is_a?(Array) ? parsed["message"].join(", ") : parsed["message"].to_s
+      else
+        @body
+      end
+    end
+  end
+
+  def initialize(base_url:, token:, project_id:, mr_iid:, diff_refs:)
+    @token       = token
+    @mr_iid      = mr_iid
+    @diff_refs   = diff_refs
+    @enc_project = CGI.escape(project_id.to_s)
+    @api_root    = "#{base_url}/api/v4"
+  end
+
+  # Creates draft notes (inline + summary), publishes them in one batch,
+  # then approves the MR if verdict is "approve".
+  # Raises ApiError on any unrecoverable GitLab error.
+  def submit(comments:, summary:, verdict:, sha:, gitlab_client:)
+    inline_errors = []
+    comments.each do |comment|
+      create_draft_note(comment["body"], position: build_position(comment))
+    rescue ApiError => e
+      inline_errors << "#{comment["file"]}:#{comment["line"]} — #{e.detail}"
+    end
+
+    unless inline_errors.empty?
+      warn "\n  ⚠ #{inline_errors.size} inline note(s) could not be created:"
+      inline_errors.each { |err| warn "    • #{err}" }
+    end
+
+    marker = "#{REVIEW_MARKER_TAG}#{sha} -->"
+    create_draft_note(":mag: **Code Review**\n\n#{summary}\n\n#{marker}")
+
+    publish_all_drafts!
+
+    gitlab_client.approve_merge_request(@enc_project, @mr_iid) if verdict == "approve"
+  end
+
+  private
+
+  def create_draft_note(body, position: nil)
+    payload = { note: body }
+    payload[:position] = build_position(position) if position
+    http_post(draft_notes_uri, payload)
+  end
+
+  def publish_all_drafts!
+    http_post(URI("#{draft_notes_uri}/bulk_publish"), {})
+  end
+
+  def build_position(comment)
+    {
+      position_type: "text",
+      base_sha:      @diff_refs.base_sha,
+      start_sha:     @diff_refs.start_sha,
+      head_sha:      @diff_refs.head_sha,
+      new_path:      comment["file"],
+      new_line:      comment["line"]
+    }
+  end
+
+  def draft_notes_uri
+    URI("#{@api_root}/projects/#{@enc_project}/merge_requests/#{@mr_iid}/draft_notes")
+  end
+
+  def http_post(uri, payload)
+    http              = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl      = (uri.scheme == "https")
+    http.read_timeout = 30
+
+    req = Net::HTTP::Post.new(uri)
+    req["PRIVATE-TOKEN"] = @token
+    req["Content-Type"]  = "application/json"
+    req.body = payload.to_json
+
+    response = http.request(req)
+    code     = response.code.to_i
+    raise ApiError.new(code, response.body) unless (200..299).cover?(code)
+
+    JSON.parse(response.body) rescue {}
+  end
+end
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+pastel = Pastel.new
+prompt = TTY::Prompt.new
+token  = ENV.fetch("GITLAB_API_TOKEN") { abort "Missing GITLAB_API_TOKEN env var" }
+
+puts pastel.bold.blue("╔═ MR Reviewer ═══════════════════════════════════════╗")
+
+# 1. Parse CLI args
+args    = parse_args(ARGV)
+client  = build_client(args[:base_url])
+project = args[:project_path]
+mr_iid  = args[:mr_iid]
+
+# 2. Fetch MR metadata
+puts "  Fetching MR !#{mr_iid} from #{project}…"
+mr = client.merge_request(project, mr_iid)
+
+puts pastel.green("  #{mr.title}")
+puts "  #{mr.source_branch} → #{mr.target_branch}"
+puts "  HEAD: #{mr.sha[0, 8]}"
+
+# 3. Idempotence – skip if this exact commit was already reviewed
+reviewed_sha = last_reviewed_sha(client, project, mr_iid)
+
+if reviewed_sha == mr.sha
+  puts pastel.yellow("\n  Commit #{mr.sha[0, 8]} has already been reviewed. Nothing to do.")
+  exit 0
+end
+
+puts pastel.cyan("  Previous review SHA: #{reviewed_sha[0, 8]}") if reviewed_sha
+
+# 4. Checkout source branch under a private review branch name
+branch_mgr = BranchManager.new(mr.source_branch, mr_iid)
+at_exit { branch_mgr&.teardown! }
+branch_mgr.setup!
+puts pastel.green("  ✓ Checked out #{branch_mgr.review_branch}")
+
+# 5. Run Claude Code review
+puts pastel.bold("\n  ⏳ Running Claude Code review (timeout: #{CLAUDE_TIMEOUT_SEC}s)…")
+review = run_claude_review(mr.target_branch, branch_mgr.review_branch)
+
+puts pastel.green("  ✓ #{review["comments"].size} comment(s) — initial verdict: #{review["verdict"]}")
+
+# 6. Interactive comment validation — or resume from saved draft
+approved_comments = nil
+final_summary     = nil
+final_verdict     = nil
+
+draft = DraftState.load(mr_iid)
+if draft && draft["sha"] == mr.sha
+  puts pastel.yellow("\n  ⚠ A saved draft exists for commit #{mr.sha[0, 8]} (#{DraftState.path(mr_iid)}).")
+  if prompt.yes?("Resume from saved draft? (No = re-run Claude review)")
+    approved_comments = draft["comments"]
+    final_summary     = draft["summary"]
+    final_verdict     = draft["verdict"]
+    puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from draft.")
+  end
+end
+
+unless approved_comments
+  validator         = CommentValidator.new(review["comments"], pastel: pastel, prompt: prompt)
+  approved_comments = validator.run
+
+  has_blocking  = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
+  final_verdict = has_blocking ? "request_changes" : review["verdict"]
+  final_summary = review["summary"]
+end
+
+# 7. Final review screen — summary edit + confirmation
+loop do
+  system("clear")
+  puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
+  puts final_summary
+  puts
+  puts "  Inline comments : #{approved_comments.size} / #{review["comments"].size} kept"
+
+  verdict_display = if final_verdict == "approve"
+    pastel.green.bold("APPROVE ✓")
+  else
+    pastel.red.bold("REQUEST CHANGES ✗")
+  end
+  puts "  Verdict         : #{verdict_display}"
+  puts
+
+  action = prompt.select("Action?", ["Submit", "Edit summary", "Cancel"], cycle: true)
+
+  case action
+  when "Edit summary"
+    edited = nil
+    Tempfile.create(["mr_summary", ".md"]) do |f|
+      f.write(final_summary)
+      f.flush
+      TTY::Editor.open(f.path)
+      edited = File.read(f.path).strip
+    end
+    final_summary = edited if edited && !edited.empty?
+  when "Cancel"
+    puts pastel.yellow("  Review cancelled. Nothing was submitted.")
+    exit 0
+  when "Submit"
+    break
+  end
+end
+
+# 8. Persist draft before any GitLab call
+DraftState.save(mr_iid,
+  comments: approved_comments,
+  summary:  final_summary,
+  verdict:  final_verdict,
+  sha:      mr.sha
+)
+puts pastel.dim("  Draft saved to #{DraftState.path(mr_iid)}")
+
+# 9. Submit to GitLab
+base_url = args[:base_url] || "https://#{URI.parse(client.endpoint).host}"
+
+submitter = ReviewSubmitter.new(
+  base_url:   base_url,
+  token:      token,
+  project_id: project,
+  mr_iid:     mr_iid,
+  diff_refs:  mr.diff_refs
+)
+
+begin
+  submitter.submit(
+    comments:       approved_comments,
+    summary:        final_summary,
+    verdict:        final_verdict,
+    sha:            mr.sha,
+    gitlab_client:  client
+  )
+rescue ReviewSubmitter::ApiError => e
+  puts pastel.red.bold("\n  ✖ GitLab API error: #{e}")
+  puts pastel.red("    #{e.detail}")
+  puts
+  puts pastel.yellow("  Draft saved — re-run the script to retry without losing your edits.")
+  exit 1
+end
+
+DraftState.delete(mr_iid)
+puts pastel.bold.green("\n  ✅ Review submitted (#{final_verdict.gsub("_", " ")}).")
