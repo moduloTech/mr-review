@@ -58,6 +58,7 @@ class ClaudeParseError < ClaudeError; end
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 REVIEW_MARKER_TAG    = "<!-- mr-reviewer-sha:"
+DRAFT_MARKER         = "<!-- mr-review -->"
 CONTEXT_LINES        = 4
 
 # ── Config module ─────────────────────────────────────────────────────────────
@@ -843,17 +844,20 @@ class ReviewSubmitter
   private
 
   def create_draft_note(body, position: nil)
-    payload = { note: body }
+    payload = { note: "#{body}\n#{DRAFT_MARKER}" }
     payload[:position] = position if position
     http_post(draft_notes_uri, payload)
   end
 
   def delete_stale_drafts!
     drafts = http_get(draft_notes_uri)
-    return unless drafts.is_a?(Array) && !drafts.empty?
+    return unless drafts.is_a?(Array)
 
-    warn "  ⚠ Deleting #{drafts.size} stale draft note(s) from previous attempts…"
-    drafts.each do |draft|
+    own_drafts = drafts.select { |d| d["note"].to_s.include?(DRAFT_MARKER) }
+    return if own_drafts.empty?
+
+    warn "  ⚠ Deleting #{own_drafts.size} stale draft note(s) from previous attempts…"
+    own_drafts.each do |draft|
       http_delete(URI("#{draft_notes_uri}/#{draft["id"]}"))
     rescue ApiError
       # best effort
