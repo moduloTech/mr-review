@@ -2,7 +2,7 @@
 # frozen_string_literal: true
 
 # =============================================================================
-# mr_reviewer.rb
+# mr-review
 #
 # Automated GitLab Merge Request review via Claude Code.
 # Fetches the MR diff, runs Claude Code in review mode, presents each comment
@@ -10,14 +10,14 @@
 # and approves or requests changes accordingly.
 #
 # Usage:
-#   ./mr_review <MR_URL>
-#   ./mr_review <PROJECT_PATH> <MR_IID>
-#   ./mr_review -d postgres://localhost/mr_review_dev <MR_URL>
+#   mr-review <MR_URL>
+#   mr-review <PROJECT_PATH> <MR_IID>
+#   mr-review -d ~/.mr-review/mr-review.db <MR_URL>
 #
 # Configuration (priority: defaults < config.yml < env vars < CLI flags):
-#   ~/.mr_review/config.yml   Central config file
+#   ~/.mr-review/config.yml   Central config file
 #   GITLAB_API_TOKEN          Personal Access Token with api scope
-#   DATABASE_URL              PostgreSQL connection URL
+#   DATABASE_URL              SQLite database path (default: ~/.mr-review/mr-review.db)
 #   CLAUDE_BIN                Path to claude binary (default: "claude")
 #   CLAUDE_TIMEOUT            Review timeout in seconds (default: 360)
 # =============================================================================
@@ -31,7 +31,7 @@ gemfile(true) do
   gem "tty-editor", "~> 0.7"
   gem "pastel",     "~> 0.8"
   gem "sequel",     "~> 5.0"
-  gem "pg",         "~> 1.5"
+  gem "sqlite3",    "~> 2.0"
 end
 
 require "cgi"
@@ -63,11 +63,13 @@ CONTEXT_LINES        = 4
 # ── Config module ─────────────────────────────────────────────────────────────
 
 module Config
-  CONFIG_DIR  = File.expand_path("~/.mr_review")
+  CONFIG_DIR  = File.expand_path("~/.mr-review")
   CONFIG_PATH = File.join(CONFIG_DIR, "config.yml")
 
+  DEFAULT_DB_PATH = File.join(CONFIG_DIR, "mr-review.db")
+
   DEFAULTS = {
-    "database_url"     => nil,
+    "database_url"     => "sqlite://#{DEFAULT_DB_PATH}",
     "gitlab_api_token" => nil,
     "claude_bin"       => "claude",
     "claude_timeout"   => 360
@@ -110,9 +112,9 @@ def parse_args(argv)
   cli_overrides = {}
 
   parser = OptionParser.new do |opts|
-    opts.banner = "Usage:\n  mr_review [options] <MR_URL>\n  mr_review [options] <PROJECT_PATH> <MR_IID>"
+    opts.banner = "Usage:\n  mr-review [options] <MR_URL>\n  mr-review [options] <PROJECT_PATH> <MR_IID>"
 
-    opts.on("-d", "--database-url URL", "PostgreSQL connection URL") do |v|
+    opts.on("-d", "--database-url URL", "SQLite database URL (default: sqlite://~/.mr-review/mr-review.db)") do |v|
       cli_overrides["database_url"] = v
     end
 
@@ -167,47 +169,34 @@ end
 # ── GitLab helpers ────────────────────────────────────────────────────────────
 
 def build_client(base_url, token)
-  raise MrReviewError, "Missing GitLab API token (set GITLAB_API_TOKEN, use -t, or add to ~/.mr_review/config.yml)" unless token
+  raise MrReviewError, "Missing GitLab API token (set GITLAB_API_TOKEN, use -t, or add to ~/.mr-review/config.yml)" unless token
   opts = { private_token: token }
   opts[:endpoint] = "#{base_url}/api/v4" if base_url
   Gitlab.client(**opts)
 end
 
-# ── Database module (Sequel + PostgreSQL) ─────────────────────────────────────
+# ── Database module (Sequel + SQLite) ─────────────────────────────────────────
 
 module Database
   @db = nil
 
   def self.connect(url)
     return unless url
+    # Ensure the directory exists for the SQLite file
+    if url.start_with?("sqlite://")
+      db_path = url.sub("sqlite://", "")
+      FileUtils.mkdir_p(File.dirname(db_path))
+    end
     @db = Sequel.connect(url, max_connections: 1)
+    @db.run("PRAGMA journal_mode=WAL")
+    @db.run("PRAGMA foreign_keys=ON")
     migrate!
     true
   rescue Sequel::DatabaseConnectionError, Sequel::DatabaseError => e
-    if e.message.include?("does not exist")
-      return false unless create_database(url)
-      retry
-    end
     warn "  ⚠ Database connection failed: #{e.message}"
     @db = nil
     false
   end
-
-  def self.create_database(url)
-    uri = URI.parse(url)
-    db_name = uri.path.delete_prefix("/")
-    maintenance_url = url.sub(%r{/[^/]+\z}, "/postgres")
-    temp = Sequel.connect(maintenance_url, max_connections: 1)
-    temp.run("CREATE DATABASE #{temp.literal(db_name.to_sym)}")
-    temp.disconnect
-    warn "  ✓ Created database #{db_name}"
-    true
-  rescue StandardError => e
-    warn "  ⚠ Could not create database: #{e.message}"
-    @db = nil
-    false
-  end
-  private_class_method :create_database
 
   def self.connected?
     !@db.nil?
@@ -223,62 +212,66 @@ module Database
   def self.migrate!
     @db.run <<~SQL
       CREATE TABLE IF NOT EXISTS reviews (
-        id                  SERIAL PRIMARY KEY,
-        project_path        TEXT        NOT NULL,
-        mr_iid              INTEGER     NOT NULL,
+        id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_path        TEXT    NOT NULL,
+        mr_iid              INTEGER NOT NULL,
         mr_title            TEXT,
         source_branch       TEXT,
         target_branch       TEXT,
-        head_sha            VARCHAR(40) NOT NULL,
-        previous_sha        VARCHAR(40),
-        verdict             VARCHAR(20),
-        claude_verdict      VARCHAR(20),
-        status              VARCHAR(20) NOT NULL DEFAULT 'pending',
+        head_sha            TEXT    NOT NULL,
+        previous_sha        TEXT,
+        verdict             TEXT,
+        claude_verdict      TEXT,
+        status              TEXT    NOT NULL DEFAULT 'pending',
         summary             TEXT,
-        comments_total      INTEGER     DEFAULT 0,
-        comments_kept       INTEGER     DEFAULT 0,
+        pipeline_summary    TEXT,
+        comments_total      INTEGER DEFAULT 0,
+        comments_kept       INTEGER DEFAULT 0,
         claude_duration_sec REAL,
-        started_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-        finished_at         TIMESTAMPTZ,
-        CONSTRAINT chk_status CHECK (status IN
-          ('pending','reviewing','validated','submitted','cancelled','error'))
+        started_at          TEXT    NOT NULL DEFAULT (datetime('now')),
+        finished_at         TEXT,
+        CHECK (status IN ('pending','reviewing','validated','submitted','cancelled','error'))
       );
+    SQL
+    @db.run <<~SQL
       CREATE INDEX IF NOT EXISTS idx_reviews_lookup
         ON reviews (project_path, mr_iid, head_sha, status);
     SQL
 
     @db.run <<~SQL
       CREATE TABLE IF NOT EXISTS review_comments (
-        id            SERIAL PRIMARY KEY,
-        review_id     INTEGER     NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
-        file          TEXT        NOT NULL,
-        line          INTEGER     NOT NULL,
-        severity      VARCHAR(20),
-        category      VARCHAR(20),
-        body          TEXT        NOT NULL,
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        review_id     INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
+        file          TEXT    NOT NULL,
+        line          INTEGER NOT NULL,
+        severity      TEXT,
+        category      TEXT,
+        body          TEXT    NOT NULL,
         original_body TEXT,
-        status        VARCHAR(20) NOT NULL DEFAULT 'accepted',
-        position      INTEGER     NOT NULL,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
-        CONSTRAINT chk_comment_status CHECK (status IN ('accepted','edited','skipped'))
+        status        TEXT    NOT NULL DEFAULT 'accepted',
+        position      INTEGER NOT NULL,
+        created_at    TEXT    NOT NULL DEFAULT (datetime('now')),
+        CHECK (status IN ('accepted','edited','skipped'))
       );
+    SQL
+    @db.run <<~SQL
       CREATE INDEX IF NOT EXISTS idx_review_comments_review ON review_comments (review_id);
     SQL
 
     @db.run <<~SQL
       CREATE TABLE IF NOT EXISTS review_errors (
-        id          SERIAL PRIMARY KEY,
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
         review_id   INTEGER REFERENCES reviews(id) ON DELETE SET NULL,
-        error_class TEXT        NOT NULL,
-        message     TEXT        NOT NULL,
+        error_class TEXT NOT NULL,
+        message     TEXT NOT NULL,
         detail      TEXT,
-        phase       VARCHAR(30),
-        created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+        phase       TEXT,
+        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
+    SQL
+    @db.run <<~SQL
       CREATE INDEX IF NOT EXISTS idx_review_errors_review ON review_errors (review_id);
     SQL
-
-    @db.run "ALTER TABLE reviews ADD COLUMN IF NOT EXISTS pipeline_summary TEXT;"
   end
 
   # ── Reviews CRUD ──
@@ -408,7 +401,7 @@ class RepoManager
     host_port = uri.port && ![80, 443].include?(uri.port) ? "#{uri.host}:#{uri.port}" : uri.host
     @clone_url     = "#{uri.scheme}://oauth2:#{token}@#{host_port}/#{project_path}.git"
     @source_branch = source_branch
-    @repo_path     = File.join("/tmp", "mr_review_#{mr_iid}_#{Process.pid}")
+    @repo_path     = File.join("/tmp", "mr-review_#{mr_iid}_#{Process.pid}")
   end
 
   def setup!
@@ -758,7 +751,7 @@ end
 
 module DraftState
   def self.path(mr_iid)
-    ".mr_review_draft_#{mr_iid}.json"
+    ".mr-review_draft_#{mr_iid}.json"
   end
 
   def self.save(mr_iid, comments:, summary:, verdict:, sha:, pipeline_summary: nil)
@@ -1062,7 +1055,7 @@ def main
 
   if reviewed_sha == mr.sha
     puts pastel.yellow("\n  Commit #{mr.sha[0, 8]} has already been reviewed. Nothing to do.")
-    Database.update_review(review_id, status: "submitted", previous_sha: reviewed_sha, finished_at: Sequel.function(:now))
+    Database.update_review(review_id, status: "submitted", previous_sha: reviewed_sha, finished_at: Sequel.lit("datetime('now')"))
     exit 0
   end
 
@@ -1250,7 +1243,7 @@ def main
         Database.update_review(review_id, pipeline_summary: pipeline_summary)
       end
     when "Cancel"
-      Database.update_review(review_id, status: "cancelled", finished_at: Sequel.function(:now))
+      Database.update_review(review_id, status: "cancelled", finished_at: Sequel.lit("datetime('now')"))
       puts pastel.yellow("  Review cancelled. Nothing was submitted.")
       exit 0
     when "Submit"
@@ -1295,7 +1288,7 @@ def main
   # 14. UPDATE status: submitted
   Database.update_review(review_id,
     status:      "submitted",
-    finished_at: Sequel.function(:now)
+    finished_at: Sequel.lit("datetime('now')")
   )
 
   DraftState.delete(mr_iid)
@@ -1308,7 +1301,7 @@ rescue MrReviewError, ReviewSubmitter::ApiError => e
     message:     e.message,
     phase:       current_phase
   )
-  Database.update_review(review_id, status: "error", finished_at: Sequel.function(:now))
+  Database.update_review(review_id, status: "error", finished_at: Sequel.lit("datetime('now')"))
 
   pastel ||= Pastel.new
   warn pastel.red.bold("\n  ✖ #{e.class}: #{e.message}")
@@ -1319,7 +1312,7 @@ rescue MrReviewError, ReviewSubmitter::ApiError => e
   exit 1
 
 rescue Interrupt
-  Database.update_review(review_id, status: "cancelled", finished_at: Sequel.function(:now))
+  Database.update_review(review_id, status: "cancelled", finished_at: Sequel.lit("datetime('now')"))
   pastel ||= Pastel.new
   warn pastel.yellow("\n  Interrupted. Review cancelled.")
   exit 130
@@ -1332,7 +1325,7 @@ rescue StandardError => e
     detail:      e.backtrace&.first(10)&.join("\n"),
     phase:       current_phase
   )
-  Database.update_review(review_id, status: "error", finished_at: Sequel.function(:now))
+  Database.update_review(review_id, status: "error", finished_at: Sequel.lit("datetime('now')"))
 
   pastel ||= Pastel.new
   warn pastel.red.bold("\n  ✖ Unexpected error: #{e.class}: #{e.message}")

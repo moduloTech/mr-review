@@ -4,22 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-A single-file Ruby CLI tool (`mr_review`) that automates GitLab Merge Request code reviews using Claude Code. It fetches an MR diff, invokes `claude -p` to produce a structured JSON review, presents each comment interactively for human validation (accept/edit/skip), then submits the approved comments as GitLab draft notes and approves or requests changes. All review data is persisted to PostgreSQL for tracking and analytics.
+A single-file Ruby CLI tool (`bin/mr-review`) distributed via Homebrew (`modulotech/tap`) that automates GitLab Merge Request code reviews using Claude Code. It fetches an MR diff, invokes `claude -p` to produce a structured JSON review, presents each comment interactively for human validation (accept/edit/skip), then submits the approved comments as GitLab draft notes and approves or requests changes. All review data is persisted to SQLite for tracking and analytics.
 
 ## Running
 
 ```bash
 # Review by MR URL
-./mr_review https://source.modulotech.fr/modulosource/ff/fast/core/-/merge_requests/687
+./bin/mr-review https://source.modulotech.fr/modulosource/ff/fast/core/-/merge_requests/687
 
 # Review by project path + MR IID
-./mr_review modulosource/ff/fast/core 687
+./bin/mr-review modulosource/ff/fast/core 687
 
-# With explicit database URL
-./mr_review -d postgres://localhost/mr_review_dev <MR_URL>
+# With explicit database path
+./bin/mr-review -d sqlite://path/to/reviews.db <MR_URL>
 
 # With explicit token
-./mr_review -t glpat-xxxx <MR_URL>
+./bin/mr-review -t glpat-xxxx <MR_URL>
 ```
 
 Dependencies are installed automatically via `bundler/inline` (no separate `bundle install` needed). Requires Ruby and the `claude` CLI on PATH.
@@ -29,14 +29,14 @@ Dependencies are installed automatically via `bundler/inline` (no separate `bund
 Settings are resolved in 4 layers (highest priority wins):
 
 1. **Defaults** — `claude_bin: "claude"`, `claude_timeout: 360`
-2. **Config file** — `~/.mr_review/config.yml`
+2. **Config file** — `~/.mr-review/config.yml`
 3. **Environment variables** — `GITLAB_API_TOKEN`, `DATABASE_URL`, `CLAUDE_BIN`, `CLAUDE_TIMEOUT`
 4. **CLI flags** — `-d`/`--database-url`, `-t`/`--token`, `--claude-bin`, `--claude-timeout`
 
-### Config file example (`~/.mr_review/config.yml`)
+### Config file example (`~/.mr-review/config.yml`)
 
 ```yaml
-database_url: postgres://localhost/mr_review_dev
+database_url: sqlite://~/.mr-review/mr-review.db
 gitlab_api_token: glpat-xxxxxxxxxxxxxxxxxxxx
 claude_bin: claude
 claude_timeout: 360
@@ -44,7 +44,7 @@ claude_timeout: 360
 
 ### CLI flags
 
-- `-d` / `--database-url URL` — PostgreSQL connection URL
+- `-d` / `--database-url URL` — SQLite connection URL
 - `-t` / `--token TOKEN` — GitLab API token
 - `--claude-bin PATH` — Path to claude binary
 - `--claude-timeout SECONDS` — Review timeout in seconds
@@ -86,7 +86,7 @@ The `main` method wraps everything in `begin...rescue`:
 
 A `current_phase` variable tracks the pipeline stage for error reporting.
 
-## PostgreSQL Schema
+## SQLite Schema
 
 Three normalized tables (`CREATE TABLE IF NOT EXISTS` auto-migration at each launch):
 
@@ -94,7 +94,7 @@ Three normalized tables (`CREATE TABLE IF NOT EXISTS` auto-migration at each lau
 - **`review_comments`** — every Claude comment with its validation outcome (accepted/edited/skipped, original_body if edited)
 - **`review_errors`** — errors logged with phase and backtrace
 
-The DB is optional. Without `DATABASE_URL`, the script falls back to `DraftState` (local JSON file) and GitLab notes for idempotence — same behavior as before.
+The DB defaults to `~/.mr-review/mr-review.db` (SQLite). If connection fails, the script falls back to `DraftState` (local JSON file) and GitLab notes for idempotence.
 
 ## Key Design Decisions
 
