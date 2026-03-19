@@ -6,6 +6,7 @@
 
 ### Added
 
+- Headless mode (`-H`/`--headless`): skip interactive validation and submit all comments directly.
 - Automated GitLab Merge Request review via Claude Code CLI.
 - Interactive comment validation with accept/edit/skip workflow.
 - Draft notes API for atomic batch review submission on GitLab.

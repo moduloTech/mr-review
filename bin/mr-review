@@ -134,6 +134,10 @@ def parse_args(argv)
       cli_overrides["republish"] = true
     end
 
+    opts.on("-H", "--headless", "Skip interactive validation and submit all comments directly") do
+      cli_overrides["headless"] = true
+    end
+
     opts.on("-h", "--help", "Show this help") do
       puts opts
       exit 0
@@ -1149,10 +1153,15 @@ def main
 
     total_comments = review["comments"].size
 
-    # 9. Interactive comment validation
+    # 9. Comment validation (interactive or headless)
     current_phase = "validate"
-    validator     = CommentValidator.new(review["comments"], pastel: pastel, prompt: tty, repo_path: repo_mgr.repo_path)
-    all_comments  = validator.run
+    if config["headless"]
+      all_comments = review["comments"].map { |c| c.merge("_review_status" => "accepted") }
+      puts pastel.dim("  Headless mode — accepting all #{all_comments.size} comment(s)")
+    else
+      validator    = CommentValidator.new(review["comments"], pastel: pastel, prompt: tty, repo_path: repo_mgr.repo_path)
+      all_comments = validator.run
+    end
 
     # Insert all comments into DB
     all_comments.each_with_index do |c, idx|
@@ -1189,65 +1198,67 @@ def main
 
   # 11. Final review screen — summary edit + confirmation
   current_phase = "validate"
-  loop do
-    system("clear")
-    puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
-    puts final_summary
-    puts
-
-    if pipeline_summary && !pipeline_summary.strip.empty?
-      puts pastel.bold.cyan("── Pipeline ─────────────────────────────────────────────────")
-      puts pipeline_summary
+  unless config["headless"]
+    loop do
+      system("clear")
+      puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
+      puts final_summary
       puts
-    end
 
-    puts "  Inline comments : #{approved_comments.size} / #{total_comments} kept"
-
-    verdict_display = if final_verdict == "approve"
-      pastel.green.bold("APPROVE ✓")
-    else
-      pastel.red.bold("REQUEST CHANGES ✗")
-    end
-    puts "  Verdict         : #{verdict_display}"
-    puts
-
-    menu_choices = ["Submit", "Edit summary"]
-    menu_choices << "Edit pipeline summary" if pipeline_summary && !pipeline_summary.strip.empty?
-    menu_choices << "Cancel"
-
-    action = tty.select("Action?", menu_choices, cycle: true)
-
-    case action
-    when "Edit summary"
-      edited = nil
-      Tempfile.create(["mr_summary", ".md"]) do |f|
-        f.write(final_summary)
-        f.flush
-        TTY::Editor.open(f.path)
-        edited = File.read(f.path).strip
+      if pipeline_summary && !pipeline_summary.strip.empty?
+        puts pastel.bold.cyan("── Pipeline ─────────────────────────────────────────────────")
+        puts pipeline_summary
+        puts
       end
-      if edited && !edited.empty?
-        final_summary = edited
-        Database.update_review(review_id, summary: final_summary)
+
+      puts "  Inline comments : #{approved_comments.size} / #{total_comments} kept"
+
+      verdict_display = if final_verdict == "approve"
+        pastel.green.bold("APPROVE ✓")
+      else
+        pastel.red.bold("REQUEST CHANGES ✗")
       end
-    when "Edit pipeline summary"
-      edited = nil
-      Tempfile.create(["mr_pipeline", ".md"]) do |f|
-        f.write(pipeline_summary)
-        f.flush
-        TTY::Editor.open(f.path)
-        edited = File.read(f.path).strip
+      puts "  Verdict         : #{verdict_display}"
+      puts
+
+      menu_choices = ["Submit", "Edit summary"]
+      menu_choices << "Edit pipeline summary" if pipeline_summary && !pipeline_summary.strip.empty?
+      menu_choices << "Cancel"
+
+      action = tty.select("Action?", menu_choices, cycle: true)
+
+      case action
+      when "Edit summary"
+        edited = nil
+        Tempfile.create(["mr_summary", ".md"]) do |f|
+          f.write(final_summary)
+          f.flush
+          TTY::Editor.open(f.path)
+          edited = File.read(f.path).strip
+        end
+        if edited && !edited.empty?
+          final_summary = edited
+          Database.update_review(review_id, summary: final_summary)
+        end
+      when "Edit pipeline summary"
+        edited = nil
+        Tempfile.create(["mr_pipeline", ".md"]) do |f|
+          f.write(pipeline_summary)
+          f.flush
+          TTY::Editor.open(f.path)
+          edited = File.read(f.path).strip
+        end
+        if edited && !edited.empty?
+          pipeline_summary = edited
+          Database.update_review(review_id, pipeline_summary: pipeline_summary)
+        end
+      when "Cancel"
+        Database.update_review(review_id, status: "cancelled", finished_at: Sequel.lit("datetime('now')"))
+        puts pastel.yellow("  Review cancelled. Nothing was submitted.")
+        exit 0
+      when "Submit"
+        break
       end
-      if edited && !edited.empty?
-        pipeline_summary = edited
-        Database.update_review(review_id, pipeline_summary: pipeline_summary)
-      end
-    when "Cancel"
-      Database.update_review(review_id, status: "cancelled", finished_at: Sequel.lit("datetime('now')"))
-      puts pastel.yellow("  Review cancelled. Nothing was submitted.")
-      exit 0
-    when "Submit"
-      break
     end
   end
 

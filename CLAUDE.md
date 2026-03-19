@@ -48,6 +48,7 @@ claude_timeout: 360
 - `-t` / `--token TOKEN` — GitLab API token
 - `--claude-bin PATH` — Path to claude binary
 - `--claude-timeout SECONDS` — Review timeout in seconds
+- `-H` / `--headless` — Skip interactive validation and submit all comments directly
 - `-h` / `--help` — Show help
 
 ## Architecture
