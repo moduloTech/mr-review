@@ -227,7 +227,6 @@ module Database
         verdict             TEXT,
         claude_verdict      TEXT,
         status              TEXT    NOT NULL DEFAULT 'pending',
-        summary             TEXT,
         pipeline_summary    TEXT,
         comments_total      INTEGER DEFAULT 0,
         comments_kept       INTEGER DEFAULT 0,
@@ -552,7 +551,6 @@ REVIEW_PROMPT = <<~PROMPT
 
   ```
   {
-    "summary": "<markdown: overall assessment, 3-10 sentences>",
     "verdict": "approve" | "request_changes",
     "pipeline_summary": "<markdown: pipeline analysis — only if pipeline data is provided>",
     "comments": [
@@ -569,7 +567,7 @@ REVIEW_PROMPT = <<~PROMPT
 
   ## Language
 
-  - **All `body` fields, the `summary`, and the `pipeline_summary` must be written in French.**
+  - **All `body` fields and the `pipeline_summary` must be written in French.**
   - The JSON keys and enum values (`verdict`, `severity`, `category`, etc.) stay in English.
 
   ## Constraints
@@ -584,10 +582,9 @@ PROMPT
 
 REVIEW_JSON_SCHEMA = {
   type: "object",
-  required: %w[summary verdict comments],
+  required: %w[verdict comments],
   additionalProperties: false,
   properties: {
-    summary: { type: "string", description: "Overall assessment in French, 3-10 sentences, markdown" },
     verdict: { type: "string", enum: %w[approve request_changes] },
     pipeline_summary: { type: "string", description: "Pipeline analysis in French, markdown. Only present when pipeline data is provided." },
     comments: {
@@ -758,8 +755,8 @@ module DraftState
     ".mr-review_draft_#{mr_iid}.json"
   end
 
-  def self.save(mr_iid, comments:, summary:, verdict:, sha:, pipeline_summary: nil)
-    data = { comments: comments, summary: summary, verdict: verdict, sha: sha }
+  def self.save(mr_iid, comments:, verdict:, sha:, pipeline_summary: nil)
+    data = { comments: comments, verdict: verdict, sha: sha }
     data[:pipeline_summary] = pipeline_summary if pipeline_summary
     File.write(path(mr_iid), JSON.pretty_generate(data))
   end
@@ -812,10 +809,10 @@ class ReviewSubmitter
     @api_root    = "#{base_url}/api/v4"
   end
 
-  # Creates draft notes (inline + summary), publishes them in one batch,
+  # Creates draft notes (inline + pipeline), publishes them in one batch,
   # then approves the MR if verdict is "approve".
   # Raises ApiError on any unrecoverable GitLab error.
-  def submit(comments:, summary:, verdict:, sha:, gitlab_client:, is_re_review: false,
+  def submit(comments:, verdict:, sha:, gitlab_client:, is_re_review: false,
              pipeline_summary: nil)
     delete_stale_drafts!
 
@@ -832,11 +829,7 @@ class ReviewSubmitter
     end
 
     marker = "#{REVIEW_MARKER_TAG}#{sha} -->"
-    if is_re_review
-      create_draft_note(marker)
-    else
-      create_draft_note(":mag: **Code Review**\n\n#{summary}\n\n#{marker}")
-    end
+    create_draft_note(marker)
 
     if pipeline_summary && !pipeline_summary.strip.empty?
       create_draft_note(":construction: **Pipeline**\n\n#{pipeline_summary}")
@@ -1022,7 +1015,6 @@ def main
       { "file" => c[:file], "line" => c[:line], "severity" => c[:severity],
         "category" => c[:category], "body" => c[:body] }
     end
-    final_summary    = prev[:summary]
     final_verdict    = prev[:verdict]
     pipeline_summary = prev[:pipeline_summary]
 
@@ -1034,7 +1026,7 @@ def main
       mr_iid: mr_iid, diff_refs: mr.diff_refs
     )
     submitter.submit(
-      comments: approved_comments, summary: final_summary,
+      comments: approved_comments,
       verdict: final_verdict, sha: mr.sha, gitlab_client: client,
       pipeline_summary: pipeline_summary
     )
@@ -1069,7 +1061,6 @@ def main
   # 6. Resume check — DB first, DraftState fallback
   approved_comments = nil
   all_comments      = nil
-  final_summary     = nil
   final_verdict     = nil
   total_comments    = nil
   pipeline_summary  = nil
@@ -1083,7 +1074,6 @@ def main
         { "file" => c[:file], "line" => c[:line], "severity" => c[:severity],
           "category" => c[:category], "body" => c[:body] }
       end
-      final_summary    = db_draft[:summary]
       final_verdict    = db_draft[:verdict]
       total_comments   = db_draft[:comments_total]
       pipeline_summary = db_draft[:pipeline_summary]
@@ -1099,7 +1089,6 @@ def main
       puts pastel.yellow("\n  ⚠ A saved draft exists for commit #{mr.sha[0, 8]} (#{DraftState.path(mr_iid)}).")
       if tty.yes?("Resume from saved draft? (No = start fresh)")
         approved_comments = file_draft["comments"]
-        final_summary     = file_draft["summary"]
         final_verdict     = file_draft["verdict"]
         pipeline_summary  = file_draft["pipeline_summary"]
         total_comments    = approved_comments.size
@@ -1182,28 +1171,24 @@ def main
 
     has_blocking     = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
     final_verdict    = has_blocking ? "request_changes" : review["verdict"]
-    final_summary    = review["summary"]
     pipeline_summary = review["pipeline_summary"]
 
     # 10. UPDATE status: validated
     Database.update_review(review_id,
       status:           "validated",
       verdict:          final_verdict,
-      summary:          final_summary,
       pipeline_summary: pipeline_summary,
       comments_total:   total_comments,
       comments_kept:    approved_comments.size
     )
   end
 
-  # 11. Final review screen — summary edit + confirmation
+  # 11. Final review screen — confirmation
   current_phase = "validate"
   unless config["headless"]
     loop do
       system("clear")
       puts pastel.bold.cyan("── Final Review ─────────────────────────────────────────────")
-      puts final_summary
-      puts
 
       if pipeline_summary && !pipeline_summary.strip.empty?
         puts pastel.bold.cyan("── Pipeline ─────────────────────────────────────────────────")
@@ -1221,25 +1206,13 @@ def main
       puts "  Verdict         : #{verdict_display}"
       puts
 
-      menu_choices = ["Submit", "Edit summary"]
+      menu_choices = ["Submit"]
       menu_choices << "Edit pipeline summary" if pipeline_summary && !pipeline_summary.strip.empty?
       menu_choices << "Cancel"
 
       action = tty.select("Action?", menu_choices, cycle: true)
 
       case action
-      when "Edit summary"
-        edited = nil
-        Tempfile.create(["mr_summary", ".md"]) do |f|
-          f.write(final_summary)
-          f.flush
-          TTY::Editor.open(f.path)
-          edited = File.read(f.path).strip
-        end
-        if edited && !edited.empty?
-          final_summary = edited
-          Database.update_review(review_id, summary: final_summary)
-        end
       when "Edit pipeline summary"
         edited = nil
         Tempfile.create(["mr_pipeline", ".md"]) do |f|
@@ -1267,7 +1240,6 @@ def main
   unless Database.connected?
     DraftState.save(mr_iid,
       comments:         approved_comments,
-      summary:          final_summary,
       verdict:          final_verdict,
       sha:              mr.sha,
       pipeline_summary: pipeline_summary
@@ -1288,7 +1260,6 @@ def main
 
   submitter.submit(
     comments:         approved_comments,
-    summary:          final_summary,
     verdict:          final_verdict,
     sha:              mr.sha,
     gitlab_client:    client,
