@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Embed SHA idempotence marker into the pipeline summary note instead of publishing it as a separate empty-looking comment.
+
 ## [0.1.0] - 2026-03-19
 
 ### Added

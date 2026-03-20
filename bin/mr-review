@@ -830,10 +830,11 @@ class ReviewSubmitter
     end
 
     marker = "#{REVIEW_MARKER_TAG}#{sha} -->"
-    create_draft_note(marker)
 
     if pipeline_summary && !pipeline_summary.strip.empty?
-      create_draft_note(":construction: **Pipeline**\n\n#{pipeline_summary}")
+      create_draft_note(":construction: **Pipeline**\n\n#{pipeline_summary}\n\n#{marker}")
+    else
+      create_draft_note(marker)
     end
 
     publish_all_drafts!
