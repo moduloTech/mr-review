@@ -5,6 +5,7 @@
 ### Fixed
 
 - Embed SHA idempotence marker into the pipeline summary note instead of publishing it as a separate empty-looking comment.
+- Handle `diff_refs` being nil on freshly created MRs: retry up to 3 times (5s interval) before raising a clear error instead of crashing with `NoMethodError`.
 
 ## [0.1.0] - 2026-03-19
 

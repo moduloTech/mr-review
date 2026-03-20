@@ -1003,6 +1003,17 @@ def main
   puts "  Fetching MR !#{mr_iid} from #{project}…"
   mr = client.merge_request(project, mr_iid)
 
+  # diff_refs can be nil on freshly created MRs — retry a few times
+  if mr.diff_refs.nil?
+    3.times do |i|
+      puts "  Waiting for GitLab to compute diff_refs (attempt #{i + 1}/3)…"
+      sleep 5
+      mr = client.merge_request(project, mr_iid)
+      break if mr.diff_refs
+    end
+    raise MrReviewError, "MR !#{mr_iid} has no diff_refs — GitLab may still be processing. Try again shortly." unless mr.diff_refs
+  end
+
   puts pastel.green("  #{mr.title}")
   puts "  #{mr.source_branch} → #{mr.target_branch}"
   puts "  HEAD: #{mr.sha[0, 8]}"
