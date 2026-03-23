@@ -1032,7 +1032,7 @@ def main
         "category" => c[:category], "body" => c[:body] }
     end
     final_verdict    = prev[:verdict]
-    pipeline_summary = prev[:pipeline_summary]
+    pipeline_summary = prev[:pipeline_summary]&.gsub('\n', "\n")
 
     puts pastel.cyan("  Republishing review ##{prev[:id]} (#{prev[:head_sha][0, 8]}, #{approved_comments.size} comment(s))")
 
@@ -1092,7 +1092,7 @@ def main
       end
       final_verdict    = db_draft[:verdict]
       total_comments   = db_draft[:comments_total]
-      pipeline_summary = db_draft[:pipeline_summary]
+      pipeline_summary = db_draft[:pipeline_summary]&.gsub('\n', "\n")
       # Reuse existing review row
       review_id = db_draft[:id]
       puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from DB.")
@@ -1106,7 +1106,7 @@ def main
       if tty.yes?("Resume from saved draft? (No = start fresh)")
         approved_comments = file_draft["comments"]
         final_verdict     = file_draft["verdict"]
-        pipeline_summary  = file_draft["pipeline_summary"]
+        pipeline_summary  = file_draft["pipeline_summary"]&.gsub('\n', "\n")
         total_comments    = approved_comments.size
         puts pastel.green("  ✓ Loaded #{approved_comments.size} comment(s) from draft file.")
       end
@@ -1187,7 +1187,7 @@ def main
 
     has_blocking     = approved_comments.any? { |c| %w[error warning].include?(c["severity"]) }
     final_verdict    = has_blocking ? "request_changes" : review["verdict"]
-    pipeline_summary = review["pipeline_summary"]
+    pipeline_summary = review["pipeline_summary"]&.gsub('\n', "\n")
 
     # 10. UPDATE status: validated
     Database.update_review(review_id,
