@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-03-24
+
 ### Fixed
 
 - Fix pipeline summary comments showing literal `\n` instead of actual newlines in GitLab notes.
