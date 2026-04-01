@@ -5,6 +5,7 @@
 ### Added
 
 - `-v` / `--version` CLI flag to display the current version.
+- `-l` / `--language LANG` CLI flag to set the review language (default: French). Also configurable via `language` in config file or `MR_REVIEW_LANGUAGE` env var.
 
 ## [0.1.2] - 2026-03-24
 

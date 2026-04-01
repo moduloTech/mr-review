@@ -49,6 +49,7 @@ claude_timeout: 360
 - `--claude-bin PATH` — Path to claude binary
 - `--claude-timeout SECONDS` — Review timeout in seconds
 - `-H` / `--headless` — Skip interactive validation and submit all comments directly
+- `-l` / `--language LANG` — Review language (default: French)
 - `-v` / `--version` — Show version and exit
 - `-h` / `--help` — Show help
 
@@ -100,7 +101,7 @@ The DB defaults to `~/.mr-review/mr-review.db` (SQLite). If connection fails, th
 
 ## Key Design Decisions
 
-- **Review language**: The Claude prompt mandates that all `body` and `summary` text be written in **French**; JSON keys/enums stay in English.
+- **Review language**: The Claude prompt mandates that all `body` and `summary` text be written in the configured language (default: **French**, configurable via `-l`/`--language`); JSON keys/enums stay in English.
 - **Verdict logic**: After interactive validation, the verdict is recalculated — if any accepted comment has severity `error` or `warning`, the verdict becomes `request_changes` regardless of Claude's original verdict.
 - **Draft notes over regular notes**: Uses GitLab's draft notes API (`/draft_notes`) + bulk publish so the review appears as a single atomic batch, not individual comments.
 - **No gem for draft notes**: `ReviewSubmitter` uses `Net::HTTP` directly because the `gitlab` gem doesn't expose the draft notes endpoint.

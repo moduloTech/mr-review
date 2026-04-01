@@ -75,14 +75,16 @@ module Config
     "database_url"     => "sqlite://#{DEFAULT_DB_PATH}",
     "gitlab_api_token" => nil,
     "claude_bin"       => "claude",
-    "claude_timeout"   => 360
+    "claude_timeout"   => 360,
+    "language"         => "French"
   }.freeze
 
   ENV_MAPPING = {
     "DATABASE_URL"     => "database_url",
     "GITLAB_API_TOKEN" => "gitlab_api_token",
     "CLAUDE_BIN"       => "claude_bin",
-    "CLAUDE_TIMEOUT"   => "claude_timeout"
+    "CLAUDE_TIMEOUT"   => "claude_timeout",
+    "MR_REVIEW_LANGUAGE" => "language"
   }.freeze
 
   def self.load(cli_overrides = {})
@@ -139,6 +141,10 @@ def parse_args(argv)
 
     opts.on("-H", "--headless", "Skip interactive validation and submit all comments directly") do
       cli_overrides["headless"] = true
+    end
+
+    opts.on("-l", "--language LANG", "Review language (default: French)") do |v|
+      cli_overrides["language"] = v
     end
 
     opts.on("-v", "--version", "Show version and exit") do
@@ -575,7 +581,7 @@ REVIEW_PROMPT = <<~PROMPT
 
   ## Language
 
-  - **All `body` fields and the `pipeline_summary` must be written in French.**
+  - **All `body` fields and the `pipeline_summary` must be written in %<language>s.**
   - The JSON keys and enum values (`verdict`, `severity`, `category`, etc.) stay in English.
 
   ## Constraints
@@ -588,40 +594,43 @@ REVIEW_PROMPT = <<~PROMPT
   - Produce `pipeline_summary` **only** when pipeline CI data is provided above. Omit the key entirely otherwise.
 PROMPT
 
-REVIEW_JSON_SCHEMA = {
-  type: "object",
-  required: %w[verdict comments],
-  additionalProperties: false,
-  properties: {
-    verdict: { type: "string", enum: %w[approve request_changes] },
-    pipeline_summary: { type: "string", description: "Pipeline analysis in French, markdown. Only present when pipeline data is provided." },
-    comments: {
-      type: "array",
-      items: {
-        type: "object",
-        required: %w[file line severity category body],
-        additionalProperties: false,
-        properties: {
-          file:     { type: "string", description: "Relative file path from repo root" },
-          line:     { type: "integer", description: "Line number in the NEW version of the file" },
-          severity: { type: "string", enum: %w[error warning info nitpick] },
-          category: { type: "string", enum: %w[bug security logic performance style test other] },
-          body:     { type: "string", description: "Markdown comment in French" }
+def review_json_schema(language)
+  {
+    type: "object",
+    required: %w[verdict comments],
+    additionalProperties: false,
+    properties: {
+      verdict: { type: "string", enum: %w[approve request_changes] },
+      pipeline_summary: { type: "string", description: "Pipeline analysis in #{language}, markdown. Only present when pipeline data is provided." },
+      comments: {
+        type: "array",
+        items: {
+          type: "object",
+          required: %w[file line severity category body],
+          additionalProperties: false,
+          properties: {
+            file:     { type: "string", description: "Relative file path from repo root" },
+            line:     { type: "integer", description: "Line number in the NEW version of the file" },
+            severity: { type: "string", enum: %w[error warning info nitpick] },
+            category: { type: "string", enum: %w[bug security logic performance style test other] },
+            body:     { type: "string", description: "Markdown comment in #{language}" }
+          }
         }
       }
     }
   }
-}.freeze
+end
 
 def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:, repo_path:,
-                      pipeline_section: "", pipeline_step: "")
+                      language: "French", pipeline_section: "", pipeline_step: "")
   prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch,
+                                 language: language,
                                  pipeline_section: pipeline_section, pipeline_step: pipeline_step)
 
   raw_output = nil
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
-  schema_json = Shellwords.escape(JSON.generate(REVIEW_JSON_SCHEMA))
+  schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
 
   Timeout.timeout(claude_timeout) do
     # Write output to a temp file to avoid pipe buffer truncation on large reviews.
@@ -996,6 +1005,7 @@ def main
 
   claude_bin     = config["claude_bin"]
   claude_timeout = config["claude_timeout"]
+  language       = config["language"]
 
   # 2. Connect to database (optional — graceful degradation)
   current_phase = "db_connect"
@@ -1154,7 +1164,7 @@ def main
 
     result   = run_claude_review(mr.target_branch, mr.source_branch,
                                  claude_bin: claude_bin, claude_timeout: claude_timeout,
-                                 repo_path: repo_mgr.repo_path,
+                                 repo_path: repo_mgr.repo_path, language: language,
                                  pipeline_section: pf.prompt_section,
                                  pipeline_step: pf.prompt_step)
     review   = result["review"]
