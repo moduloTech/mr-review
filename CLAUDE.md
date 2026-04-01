@@ -49,6 +49,7 @@ claude_timeout: 360
 - `--claude-bin PATH` — Path to claude binary
 - `--claude-timeout SECONDS` — Review timeout in seconds
 - `-H` / `--headless` — Skip interactive validation and submit all comments directly
+- `-v` / `--version` — Show version and exit
 - `-h` / `--help` — Show help
 
 ## Architecture
