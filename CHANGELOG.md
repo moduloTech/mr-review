@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-04-02
+
 ### Added
 
 - `-v` / `--version` CLI flag to display the current version.
