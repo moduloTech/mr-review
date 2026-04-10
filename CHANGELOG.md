@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Multi-pass review with consolidation: run Claude review N times (default: 3, configurable via `--review-passes`, `REVIEW_PASSES`, or config file), accumulate all comments, then pass them through a consolidation Claude call that eliminates praise-only remarks, removes false positives, deduplicates overlapping comments, and verifies relevance. The consolidated result feeds into the existing validation/submission flow.
+
 ## [0.1.3] - 2026-04-02
 
 ### Added

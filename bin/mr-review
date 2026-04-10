@@ -76,6 +76,7 @@ module Config
     "gitlab_api_token" => nil,
     "claude_bin"       => "claude",
     "claude_timeout"   => 360,
+    "review_passes"    => 3,
     "language"         => "French"
   }.freeze
 
@@ -84,6 +85,7 @@ module Config
     "GITLAB_API_TOKEN" => "gitlab_api_token",
     "CLAUDE_BIN"       => "claude_bin",
     "CLAUDE_TIMEOUT"   => "claude_timeout",
+    "REVIEW_PASSES"    => "review_passes",
     "MR_REVIEW_LANGUAGE" => "language"
   }.freeze
 
@@ -106,6 +108,7 @@ module Config
 
     # Coerce types
     config["claude_timeout"] = config["claude_timeout"].to_i
+    config["review_passes"]  = config["review_passes"].to_i
 
     config
   end
@@ -133,6 +136,10 @@ def parse_args(argv)
 
     opts.on("--claude-timeout SECONDS", Integer, "Review timeout in seconds") do |v|
       cli_overrides["claude_timeout"] = v
+    end
+
+    opts.on("--review-passes N", Integer, "Number of review passes (default: 3)") do |v|
+      cli_overrides["review_passes"] = v
     end
 
     opts.on("-R", "--republish", "Republish comments from the last submitted review") do
@@ -665,6 +672,129 @@ rescue JSON::ParserError => e
   raise ClaudeParseError, "Claude returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
 end
 
+# ── Multi-pass consolidation ─────────────────────────────────────────────────
+#
+# After N independent review passes, a consolidation step deduplicates comments,
+# removes praise-only remarks, and verifies relevance of each remaining comment.
+
+CONSOLIDATION_PROMPT = <<~PROMPT
+  You are a senior code reviewer performing quality control on a batch of review comments.
+
+  Multiple independent review passes were run on the same GitLab Merge Request.
+  The combined raw comments are provided below as a JSON array.
+
+  The repository is already checked out on the MR source branch (%<review_branch>s).
+  The merge target branch is: `origin/%<target>s`.
+
+  ## Steps
+
+  1. Run `git diff origin/%<target>s...HEAD` to read the full diff so you understand the changes.
+  2. For each comment, read the relevant file to verify the comment is accurate.
+  3. Apply the filtering and deduplication rules below.
+
+  ## Rules
+
+  - **Remove praise**: Eliminate any comment that merely validates or praises a good approach
+    without pointing out an actual issue (e.g. "Good use of…", "Nice refactor", "This looks correct").
+  - **Remove false positives**: Eliminate comments that are factually wrong after reading the code.
+  - **Deduplicate**: When multiple comments flag the same issue on the same file and line (or
+    very close lines), keep only the most precise and actionable one.
+  - **Merge complementary comments**: When different passes spotted related aspects of the same
+    issue, merge them into a single, richer comment.
+  - **Preserve all genuine issues**: Do NOT remove comments that flag real bugs, security issues,
+    performance problems, missing tests, or style violations — even if only one pass caught them.
+  - **Severity review**: Verify that the severity assigned to each kept comment is appropriate.
+    Adjust if needed (e.g. a "warning" that is actually a nitpick should be downgraded).
+
+  ## Raw comments from %<pass_count>d review passes
+
+  ```json
+  %<raw_comments_json>s
+  ```
+
+  ## Output format
+
+  Respond with **only** a valid JSON object. No markdown fences, no preamble, no explanation.
+
+  ```
+  {
+    "verdict": "approve" | "request_changes",
+    "pipeline_summary": "<keep the best pipeline_summary from the passes, if any>",
+    "comments": [
+      {
+        "file": "<relative file path from repo root>",
+        "line": <integer — line number in the NEW version of the file>,
+        "severity": "error" | "warning" | "info" | "nitpick",
+        "category": "bug" | "security" | "logic" | "performance" | "style" | "test" | "other",
+        "body": "<markdown comment>"
+      }
+    ]
+  }
+  ```
+
+  ## Language
+
+  - **All `body` fields and the `pipeline_summary` must be written in %<language>s.**
+  - The JSON keys and enum values stay in English.
+
+  ## Constraints
+
+  - `verdict` must be `"approve"` only when there are **zero** `"error"` or `"warning"` comments.
+  - Only keep comments on lines that are part of the diff.
+  - The `comments` array may be empty only when `verdict` is `"approve"`.
+PROMPT
+
+def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_count:,
+                             claude_bin:, claude_timeout:, repo_path:, language: "French",
+                             pipeline_summaries: [])
+  best_pipeline_summary = pipeline_summaries.compact.reject(&:empty?).max_by(&:length)
+
+  # Tag each comment with its pass number for traceability in the prompt
+  tagged = raw_comments.each_with_index.map { |c, i| c.merge("_pass" => c["_pass"] || (i + 1)) }
+
+  prompt = format(CONSOLIDATION_PROMPT,
+                  target: target_branch, review_branch: review_branch,
+                  pass_count: pass_count, language: language,
+                  raw_comments_json: JSON.pretty_generate(tagged))
+
+  raw_output = nil
+  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+
+  schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
+
+  Timeout.timeout(claude_timeout) do
+    Tempfile.create(["claude_consolidation", ".txt"]) do |f|
+      f.close
+      system("#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
+      unless $CHILD_STATUS.success?
+        raise ClaudeError, "#{claude_bin} -p (consolidation) exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
+      end
+      raw_output = File.read(f.path)
+    end
+  end
+
+  duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+
+  envelope = JSON.parse(raw_output)
+
+  review = if envelope.is_a?(Hash) && envelope["structured_output"].is_a?(Hash)
+    envelope["structured_output"]
+  elsif envelope.is_a?(Hash) && envelope["result"].is_a?(String) && !envelope["result"].empty?
+    JSON.parse(envelope["result"])
+  else
+    raise ClaudeParseError, "Unexpected envelope structure (consolidation): #{envelope.keys.inspect}"
+  end
+
+  # Inject the best pipeline_summary if consolidation didn't produce one
+  review["pipeline_summary"] ||= best_pipeline_summary
+
+  { "review" => review, "duration" => duration.round(1) }
+rescue Timeout::Error
+  raise ClaudeTimeoutError, "Claude Code (consolidation) timed out after #{claude_timeout}s."
+rescue JSON::ParserError => e
+  raise ClaudeParseError, "Consolidation returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
+end
+
 # ── Interactive comment validator ─────────────────────────────────────────────
 
 class CommentValidator
@@ -1005,6 +1135,7 @@ def main
 
   claude_bin     = config["claude_bin"]
   claude_timeout = config["claude_timeout"]
+  review_passes  = config["review_passes"]
   language       = config["language"]
 
   # 2. Connect to database (optional — graceful degradation)
@@ -1157,21 +1288,51 @@ def main
       puts pastel.dim("  ℹ No pipeline found for HEAD SHA #{mr.sha[0, 8]}")
     end
 
-    # 8. Run Claude Code review
+    # 8. Run Claude Code review (multi-pass + consolidation)
     current_phase = "claude"
     Database.update_review(review_id, status: "reviewing")
-    puts pastel.bold("\n  ⏳ Running Claude Code review (timeout: #{claude_timeout}s)…")
+    puts pastel.bold("\n  ⏳ Running #{review_passes} review pass(es) (timeout: #{claude_timeout}s each)…")
 
-    result   = run_claude_review(mr.target_branch, mr.source_branch,
+    all_raw_comments    = []
+    pipeline_summaries  = []
+    total_duration      = 0.0
+    pass_verdicts       = []
+
+    review_passes.times do |i|
+      pass_num = i + 1
+      puts pastel.bold("  Pass #{pass_num}/#{review_passes}…")
+
+      result = run_claude_review(mr.target_branch, mr.source_branch,
                                  claude_bin: claude_bin, claude_timeout: claude_timeout,
                                  repo_path: repo_mgr.repo_path, language: language,
                                  pipeline_section: pf.prompt_section,
                                  pipeline_step: pf.prompt_step)
-    review   = result["review"]
-    duration = result["duration"]
+      pass_review = result["review"]
+      total_duration += result["duration"]
+      pass_verdicts << pass_review["verdict"]
+      pipeline_summaries << pass_review["pipeline_summary"]
 
-    Database.update_review(review_id, claude_duration_sec: duration, claude_verdict: review["verdict"])
-    puts pastel.green("  ✓ #{review["comments"].size} comment(s) — initial verdict: #{review["verdict"]} (#{duration}s)")
+      tagged_comments = pass_review["comments"].map { |c| c.merge("_pass" => pass_num) }
+      all_raw_comments.concat(tagged_comments)
+
+      puts pastel.green("    ✓ #{pass_review["comments"].size} comment(s) — verdict: #{pass_review["verdict"]} (#{result["duration"]}s)")
+    end
+
+    puts pastel.bold("\n  ⏳ Consolidating #{all_raw_comments.size} comment(s) from #{review_passes} passes…")
+
+    consolidation = run_claude_consolidation(
+      all_raw_comments,
+      target_branch: mr.target_branch, review_branch: mr.source_branch,
+      pass_count: review_passes,
+      claude_bin: claude_bin, claude_timeout: claude_timeout,
+      repo_path: repo_mgr.repo_path, language: language,
+      pipeline_summaries: pipeline_summaries
+    )
+    review   = consolidation["review"]
+    total_duration += consolidation["duration"]
+
+    Database.update_review(review_id, claude_duration_sec: total_duration.round(1), claude_verdict: review["verdict"])
+    puts pastel.green("  ✓ Consolidation: #{review["comments"].size} comment(s) kept — verdict: #{review["verdict"]} (total: #{total_duration.round(1)}s)")
 
     total_comments = review["comments"].size
 
