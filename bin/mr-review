@@ -9,7 +9,7 @@ VERSION = "0.1.3"
 # Automated GitLab Merge Request review via Claude Code.
 # Fetches the MR diff, runs Claude Code in review mode, presents each comment
 # for interactive validation, then submits a single batch review (draft notes)
-# and approves or requests changes accordingly.
+# and posts the verdict in the summary note.
 #
 # Usage:
 #   mr-review <MR_URL>
@@ -956,10 +956,9 @@ class ReviewSubmitter
     @api_root    = "#{base_url}/api/v4"
   end
 
-  # Creates draft notes (inline + pipeline), publishes them in one batch,
-  # then approves the MR if verdict is "approve".
+  # Creates draft notes (inline + pipeline + verdict), publishes them in one batch.
   # Raises ApiError on any unrecoverable GitLab error.
-  def submit(comments:, verdict:, sha:, gitlab_client:, is_re_review: false,
+  def submit(comments:, verdict:, sha:, is_re_review: false,
              pipeline_summary: nil)
     delete_stale_drafts!
 
@@ -977,15 +976,18 @@ class ReviewSubmitter
 
     marker = "#{REVIEW_MARKER_TAG}#{sha} -->"
 
-    if pipeline_summary && !pipeline_summary.strip.empty?
-      create_draft_note(":construction: **Pipeline**\n\n#{pipeline_summary}\n\n#{marker}")
-    else
-      create_draft_note(marker)
-    end
+    verdict_emoji = verdict == "approve" ? ":white_check_mark:" : ":x:"
+    verdict_label = verdict == "approve" ? "APPROVE" : "REQUEST CHANGES"
+    verdict_line  = "#{verdict_emoji} **Verdict: #{verdict_label}**"
+
+    summary_parts = []
+    summary_parts << ":construction: **Pipeline**\n\n#{pipeline_summary}" if pipeline_summary && !pipeline_summary.strip.empty?
+    summary_parts << verdict_line
+    summary_parts << marker
+
+    create_draft_note(summary_parts.join("\n\n"))
 
     publish_all_drafts!
-
-    gitlab_client.approve_merge_request(@project_id, @mr_iid) if verdict == "approve"
   end
 
   private
@@ -1191,7 +1193,7 @@ def main
     )
     submitter.submit(
       comments: approved_comments,
-      verdict: final_verdict, sha: mr.sha, gitlab_client: client,
+      verdict: final_verdict, sha: mr.sha,
       pipeline_summary: pipeline_summary
     )
     puts pastel.bold.green("\n  ✅ Review republished (#{final_verdict.gsub("_", " ")}).")
@@ -1456,7 +1458,6 @@ def main
     comments:         approved_comments,
     verdict:          final_verdict,
     sha:              mr.sha,
-    gitlab_client:    client,
     is_re_review:     !!reviewed_sha,
     pipeline_summary: pipeline_summary
   )
