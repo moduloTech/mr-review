@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.3.1] - 2026-04-13
+
+### Fixed
+
+- `issue-md` invocation failed with a Bundler error when called from mr-review (itself running under `bundler/inline`). The child process inherited the parent's `BUNDLE_*` environment, which broke issue-md's own `bundler/inline` setup. The shellout is now wrapped in `Bundler.with_unbundled_env`.
+
 ## [0.3.0] - 2026-04-13
 
 ### Added

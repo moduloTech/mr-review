@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # =============================================================================
 # mr-review
@@ -267,7 +267,9 @@ module IssueContext
   # Calls issue-md to fetch the issue body+comments as markdown. Returns the markdown string.
   def fetch_markdown(issue_url, bin, token)
     cmd = [bin, "-t", token, issue_url]
-    out, status = Open3.capture2e(*cmd)
+    # Unset BUNDLE_* env vars inherited from mr-review's own bundler/inline context,
+    # otherwise issue-md's bundler/inline setup fails.
+    out, status = Bundler.with_unbundled_env { Open3.capture2e(*cmd) }
     unless status.success?
       tail = out.lines.last(5).join.strip
       raise MrReviewError, "issue-md (#{bin}) failed: #{tail.empty? ? "exit #{status.exitstatus}" : tail}"
