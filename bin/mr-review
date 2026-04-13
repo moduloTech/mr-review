@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # =============================================================================
 # mr-review
@@ -59,6 +59,10 @@ class MrReviewError < StandardError; end
 class ClaudeError < MrReviewError; end
 class ClaudeTimeoutError < ClaudeError; end
 class ClaudeParseError < ClaudeError; end
+
+# Internal: raised inside a single Claude attempt when the failure looks transient
+# (API stream idle, 5xx, overload). Caught by invoke_claude_cli to trigger a retry.
+class ClaudeRetryableError < StandardError; end
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -718,6 +722,101 @@ def review_json_schema(language)
   }
 end
 
+# ── Claude CLI invocation with retries ───────────────────────────────────────
+#
+# `claude -p` can fail mid-stream with transient API errors (stream idle
+# timeout, 5xx, overloaded). In that case the JSON envelope is still emitted
+# with `is_error: true` and the process exits 1. We detect these and retry up
+# to CLAUDE_MAX_ATTEMPTS times with exponential-ish backoff. Each attempt gets
+# its own claude_timeout budget.
+
+CLAUDE_MAX_ATTEMPTS      = 3
+CLAUDE_RETRY_BACKOFF_SEC = [30, 90].freeze
+
+CLAUDE_RETRYABLE_PATTERNS = [
+  /Stream idle timeout/i,
+  /API Error/i,
+  /Overloaded/i,
+  /rate.?limit/i,
+  /ECONNRESET/i,
+  /connection reset/i,
+  /50[234] /, # 502/503/504
+  /Gateway Time-?out/i,
+  /Service Unavailable/i,
+  /Bad Gateway/i
+].freeze
+
+def claude_retryable_failure?(raw_output)
+  return true if raw_output.nil? || raw_output.strip.empty?
+
+  envelope = JSON.parse(raw_output)
+  return false unless envelope.is_a?(Hash) && envelope["is_error"]
+
+  result = envelope["result"].to_s
+  CLAUDE_RETRYABLE_PATTERNS.any? { |pat| result.match?(pat) }
+rescue JSON::ParserError
+  # Unparseable output from a failed run — likely mid-stream crash. Retry.
+  true
+end
+
+def claude_failure_snippet(raw_output)
+  return "(no output)" if raw_output.nil? || raw_output.strip.empty?
+
+  envelope = JSON.parse(raw_output)
+  if envelope.is_a?(Hash) && envelope["result"].is_a?(String)
+    envelope["result"][0, 200]
+  else
+    raw_output[0, 200]
+  end
+rescue JSON::ParserError
+  raw_output[0, 200]
+end
+
+def invoke_claude_cli(cmd, repo_path:, claude_timeout:, label:)
+  attempt      = 0
+  last_raised  = nil
+
+  loop do
+    attempt += 1
+    begin
+      raw_output = nil
+      Timeout.timeout(claude_timeout) do
+        Tempfile.create(["claude_#{label}", ".txt"]) do |f|
+          f.close
+          system("#{cmd} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
+          status     = $CHILD_STATUS
+          raw_output = File.read(f.path)
+
+          unless status.success?
+            if claude_retryable_failure?(raw_output)
+              raise ClaudeRetryableError, claude_failure_snippet(raw_output)
+            end
+            raise ClaudeError,
+                  "claude -p (#{label}) exited with status #{status.exitstatus}\n#{raw_output[0, 500]}"
+          end
+        end
+      end
+      return raw_output
+    rescue ClaudeRetryableError => e
+      last_raised = ClaudeError.new("Claude Code (#{label}) transient failure: #{e.message}")
+      reason      = "transient API error — #{e.message}"
+    rescue Timeout::Error
+      last_raised = ClaudeTimeoutError.new(
+        "Claude Code (#{label}) timed out after #{claude_timeout}s (#{attempt} attempt(s))."
+      )
+      reason = "timed out after #{claude_timeout}s"
+    end
+
+    if attempt >= CLAUDE_MAX_ATTEMPTS
+      raise last_raised
+    end
+
+    backoff = CLAUDE_RETRY_BACKOFF_SEC[attempt - 1] || CLAUDE_RETRY_BACKOFF_SEC.last
+    warn "    ⚠ claude #{label} attempt #{attempt}/#{CLAUDE_MAX_ATTEMPTS} failed (#{reason}); retrying in #{backoff}s…"
+    sleep(backoff)
+  end
+end
+
 def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:, repo_path:,
                       language: "French", pipeline_section: "", pipeline_step: "",
                       issue_section: "")
@@ -726,22 +825,13 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
                                  pipeline_section: pipeline_section, pipeline_step: pipeline_step,
                                  issue_section: issue_section)
 
-  raw_output = nil
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
+  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json}"
 
-  Timeout.timeout(claude_timeout) do
-    # Write output to a temp file to avoid pipe buffer truncation on large reviews.
-    Tempfile.create(["claude_review", ".txt"]) do |f|
-      f.close
-      system("#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
-      unless $CHILD_STATUS.success?
-        raise ClaudeError, "#{claude_bin} -p exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
-      end
-      raw_output = File.read(f.path)
-    end
-  end
+  # Write output to a temp file to avoid pipe buffer truncation on large reviews.
+  raw_output = invoke_claude_cli(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: "review")
 
   duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
 
@@ -758,8 +848,6 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
   end
 
   { "review" => review, "duration" => duration.round(1) }
-rescue Timeout::Error
-  raise ClaudeTimeoutError, "Claude Code timed out after #{claude_timeout}s. Try increasing CLAUDE_TIMEOUT."
 rescue JSON::ParserError => e
   raise ClaudeParseError, "Claude returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
 end
@@ -850,21 +938,12 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
                   raw_comments_json: JSON.pretty_generate(tagged),
                   issue_section: issue_section)
 
-  raw_output = nil
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
+  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json}"
 
-  Timeout.timeout(claude_timeout) do
-    Tempfile.create(["claude_consolidation", ".txt"]) do |f|
-      f.close
-      system("#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
-      unless $CHILD_STATUS.success?
-        raise ClaudeError, "#{claude_bin} -p (consolidation) exited with status #{$CHILD_STATUS.exitstatus}\n#{File.read(f.path)[0, 500]}"
-      end
-      raw_output = File.read(f.path)
-    end
-  end
+  raw_output = invoke_claude_cli(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: "consolidation")
 
   duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
 
@@ -882,8 +961,6 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
   review["pipeline_summary"] ||= best_pipeline_summary
 
   { "review" => review, "duration" => duration.round(1) }
-rescue Timeout::Error
-  raise ClaudeTimeoutError, "Claude Code (consolidation) timed out after #{claude_timeout}s."
 rescue JSON::ParserError => e
   raise ClaudeParseError, "Consolidation returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
 end
@@ -1434,17 +1511,26 @@ def main
     pipeline_summaries  = []
     total_duration      = 0.0
     pass_verdicts       = []
+    pass_failures       = []
 
     review_passes.times do |i|
       pass_num = i + 1
       puts pastel.bold("  Pass #{pass_num}/#{review_passes}…")
 
-      result = run_claude_review(mr.target_branch, mr.source_branch,
-                                 claude_bin: claude_bin, claude_timeout: claude_timeout,
-                                 repo_path: repo_mgr.repo_path, language: language,
-                                 pipeline_section: pf.prompt_section,
-                                 pipeline_step: pf.prompt_step,
-                                 issue_section: issue_section)
+      begin
+        result = run_claude_review(mr.target_branch, mr.source_branch,
+                                   claude_bin: claude_bin, claude_timeout: claude_timeout,
+                                   repo_path: repo_mgr.repo_path, language: language,
+                                   pipeline_section: pf.prompt_section,
+                                   pipeline_step: pf.prompt_step,
+                                   issue_section: issue_section)
+      rescue ClaudeError, ClaudeTimeoutError, ClaudeParseError => e
+        pass_failures << { pass: pass_num, error: "#{e.class.name}: #{e.message}" }
+        puts pastel.yellow("    ⚠ Pass #{pass_num} failed after retries: #{e.class.name} — #{e.message[0, 200]}")
+        puts pastel.yellow("      Continuing with remaining passes.")
+        next
+      end
+
       pass_review = result["review"]
       total_duration += result["duration"]
       pass_verdicts << pass_review["verdict"]
@@ -1456,12 +1542,21 @@ def main
       puts pastel.green("    ✓ #{pass_review["comments"].size} comment(s) — verdict: #{pass_review["verdict"]} (#{result["duration"]}s)")
     end
 
-    puts pastel.bold("\n  ⏳ Consolidating #{all_raw_comments.size} comment(s) from #{review_passes} passes…")
+    if pass_verdicts.empty?
+      summary = pass_failures.map { |f| "  - pass #{f[:pass]}: #{f[:error][0, 300]}" }.join("\n")
+      raise ClaudeError, "All #{review_passes} review pass(es) failed:\n#{summary}"
+    end
+
+    if pass_failures.any?
+      puts pastel.yellow("\n  ⚠ #{pass_failures.size}/#{review_passes} pass(es) failed — consolidating #{pass_verdicts.size} successful pass(es).")
+    end
+
+    puts pastel.bold("\n  ⏳ Consolidating #{all_raw_comments.size} comment(s) from #{pass_verdicts.size} pass(es)…")
 
     consolidation = run_claude_consolidation(
       all_raw_comments,
       target_branch: mr.target_branch, review_branch: mr.source_branch,
-      pass_count: review_passes,
+      pass_count: pass_verdicts.size,
       claude_bin: claude_bin, claude_timeout: claude_timeout,
       repo_path: repo_mgr.repo_path, language: language,
       pipeline_summaries: pipeline_summaries,

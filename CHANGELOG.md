@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-04-13
+
+### Changed
+
+- `claude -p` invocations (review passes and consolidation) now retry up to 3 attempts on transient API failures (stream idle timeouts, 5xx, overloaded, rate limits, unparseable mid-stream output), with 30s then 90s backoff between attempts. Each attempt gets a fresh `claude_timeout` budget.
+- Multi-pass review is now fail-soft: if a single pass fails after all retries, the failure is reported and the remaining passes and consolidation still run. The run only aborts if **every** pass fails.
+
+### Known issues
+
+- `Timeout.timeout` wrapping the `claude -p` shellout does not reliably preempt the child process in MRI (Ruby's timeout raises in the main thread but cannot interrupt the blocking `system` call). A pass may therefore run well past `claude_timeout` before surfacing as a failure. The retry/fail-soft logic limits the blast radius, but a proper fix (spawn + `Process.kill` on timeout) is still outstanding.
+
 ## [0.3.1] - 2026-04-13
 
 ### Fixed
