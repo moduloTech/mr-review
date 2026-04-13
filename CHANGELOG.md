@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-04-13
+
+### Added
+
+- Accept a GitLab issue or work_item URL as input. mr-review looks up MRs related to the issue (`/issues/:iid/related_merge_requests`) and reviews the matching MR. With a single related MR it proceeds automatically; with multiple, the user is prompted to pick one (in `--headless` mode, this is a fatal error and the user is asked to pass the MR URL as an additional argument: `mr-review <ISSUE_URL> <MR_URL>`).
+- When an issue URL is provided, the issue is exported to markdown via the `issue-md` CLI and injected into the Claude review and consolidation prompts as `## Issue context`, so the reviewer can judge whether the changes match the business intent. New `--issue-md PATH` flag, `ISSUE_MD_BIN` env var, and `issue_md_bin` config key (default: `issue-md`).
+
 ## [0.2.0] - 2026-04-10
 
 ### Added

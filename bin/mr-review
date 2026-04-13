@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # =============================================================================
 # mr-review
@@ -14,6 +14,8 @@ VERSION = "0.2.0"
 # Usage:
 #   mr-review <MR_URL>
 #   mr-review <PROJECT_PATH> <MR_IID>
+#   mr-review <ISSUE_URL>                  # find related MR(s), use issue as context
+#   mr-review <ISSUE_URL> <MR_URL>         # explicit MR, issue used as context
 #   mr-review -d ~/.mr-review/mr-review.db <MR_URL>
 #
 # Configuration (priority: defaults < config.yml < env vars < CLI flags):
@@ -22,6 +24,7 @@ VERSION = "0.2.0"
 #   DATABASE_URL              SQLite database path (default: ~/.mr-review/mr-review.db)
 #   CLAUDE_BIN                Path to claude binary (default: "claude")
 #   CLAUDE_TIMEOUT            Review timeout in seconds (default: 360)
+#   ISSUE_MD_BIN              Path to issue-md binary (default: "issue-md")
 # =============================================================================
 
 require "bundler/inline"
@@ -77,7 +80,8 @@ module Config
     "claude_bin"       => "claude",
     "claude_timeout"   => 360,
     "review_passes"    => 3,
-    "language"         => "French"
+    "language"         => "French",
+    "issue_md_bin"     => "issue-md"
   }.freeze
 
   ENV_MAPPING = {
@@ -86,7 +90,8 @@ module Config
     "CLAUDE_BIN"       => "claude_bin",
     "CLAUDE_TIMEOUT"   => "claude_timeout",
     "REVIEW_PASSES"    => "review_passes",
-    "MR_REVIEW_LANGUAGE" => "language"
+    "MR_REVIEW_LANGUAGE" => "language",
+    "ISSUE_MD_BIN"     => "issue_md_bin"
   }.freeze
 
   def self.load(cli_overrides = {})
@@ -154,6 +159,10 @@ def parse_args(argv)
       cli_overrides["language"] = v
     end
 
+    opts.on("--issue-md PATH", "Path to issue-md binary (default: issue-md)") do |v|
+      cli_overrides["issue_md_bin"] = v
+    end
+
     opts.on("-v", "--version", "Show version and exit") do
       puts "mr-review #{VERSION}"
       exit 0
@@ -171,24 +180,103 @@ def parse_args(argv)
 
   mr_args = case positional.size
   when 1
-    uri = URI.parse(positional.first)
-    raise MrReviewError, "Expected an http(s) URL" unless %w[http https].include?(uri.scheme)
-
-    base_url, _, mr_segment = uri.path.partition("/-/merge_requests/")
-    raise MrReviewError, "URL does not look like a GitLab MR URL" if mr_segment.empty?
-
-    {
-      base_url:     "#{uri.scheme}://#{uri.host}",
-      project_path: base_url.delete_prefix("/"),
-      mr_iid:       mr_segment.split("/").first.to_i
-    }
+    parsed = GitLabUrl.parse(positional.first)
+    raise MrReviewError, "URL is not a GitLab MR or issue URL: #{positional.first}" unless parsed
+    case parsed[:kind]
+    when :mr
+      { base_url: parsed[:base_url], project_path: parsed[:project_path], mr_iid: parsed[:iid] }
+    when :issue
+      { base_url: parsed[:base_url], project_path: parsed[:project_path], mr_iid: nil,
+        issue_iid: parsed[:iid], issue_url: positional.first }
+    end
   when 2
-    { base_url: nil, project_path: positional[0], mr_iid: positional[1].to_i }
+    url1 = GitLabUrl.parse(positional[0])
+    url2 = GitLabUrl.parse(positional[1])
+    if url1 && url2 && [url1[:kind], url2[:kind]].sort == %i[issue mr]
+      issue, issue_url_str, mr = url1[:kind] == :issue ? [url1, positional[0], url2] : [url2, positional[1], url1]
+      { base_url: mr[:base_url], project_path: mr[:project_path], mr_iid: mr[:iid],
+        issue_iid: issue[:iid], issue_url: issue_url_str }
+    else
+      { base_url: nil, project_path: positional[0], mr_iid: positional[1].to_i }
+    end
   else
     raise MrReviewError, parser.to_s
   end
 
   mr_args.merge(config: config)
+end
+
+# ── GitLab URL parser ─────────────────────────────────────────────────────────
+
+# Parses GitLab MR, issue, and work_item URLs into { kind:, base_url:, project_path:, iid: }.
+module GitLabUrl
+  ISSUE_PATTERNS = %w[/-/issues/ /-/work_items/].freeze
+  MR_PATTERN     = "/-/merge_requests/"
+
+  module_function
+
+  def parse(url)
+    uri = URI.parse(url)
+    return nil unless %w[http https].include?(uri.scheme)
+
+    host_port = uri.port && ![80, 443].include?(uri.port) ? "#{uri.host}:#{uri.port}" : uri.host
+    base_url  = "#{uri.scheme}://#{host_port}"
+
+    if uri.path.include?(MR_PATTERN)
+      before, _, segment = uri.path.partition(MR_PATTERN)
+      iid = segment.split(%r{[/#]}).first.to_i
+      return { kind: :mr, base_url: base_url, project_path: before.delete_prefix("/"), iid: iid } if iid.positive?
+    end
+
+    ISSUE_PATTERNS.each do |pattern|
+      next unless uri.path.include?(pattern)
+
+      before, _, segment = uri.path.partition(pattern)
+      iid = segment.split(%r{[/#]}).first.to_i
+      return { kind: :issue, base_url: base_url, project_path: before.delete_prefix("/"), iid: iid } if iid.positive?
+    end
+
+    nil
+  rescue URI::InvalidURIError
+    nil
+  end
+end
+
+# ── Issue context (related MRs + issue-md markdown) ───────────────────────────
+
+module IssueContext
+  module_function
+
+  # Returns array of MR hashes (id, iid, title, state, web_url, project_id, …)
+  # for MRs related to (or closing) the given issue.
+  def related_mrs(base_url, project_path, issue_iid, token)
+    uri = URI("#{base_url}/api/v4/projects/#{CGI.escape(project_path)}/issues/#{issue_iid}/related_merge_requests")
+    http = Net::HTTP.new(uri.host, uri.port)
+    http.use_ssl = (uri.scheme == "https")
+    http.read_timeout = 30
+    req = Net::HTTP::Get.new(uri)
+    req["PRIVATE-TOKEN"] = token
+    response = http.request(req)
+    unless response.is_a?(Net::HTTPSuccess)
+      raise MrReviewError, "Failed to list related MRs (HTTP #{response.code}): #{response.body[0, 200]}"
+    end
+
+    JSON.parse(response.body)
+  end
+
+  # Calls issue-md to fetch the issue body+comments as markdown. Returns the markdown string.
+  def fetch_markdown(issue_url, bin, token)
+    cmd = [bin, "-t", token, issue_url]
+    out, status = Open3.capture2e(*cmd)
+    unless status.success?
+      tail = out.lines.last(5).join.strip
+      raise MrReviewError, "issue-md (#{bin}) failed: #{tail.empty? ? "exit #{status.exitstatus}" : tail}"
+    end
+
+    out
+  rescue Errno::ENOENT
+    raise MrReviewError, "issue-md binary not found at '#{bin}'. Install it (brew install modulotech/tap/issue-md) or set --issue-md."
+  end
 end
 
 # ── GitLab helpers ────────────────────────────────────────────────────────────
@@ -566,7 +654,7 @@ REVIEW_PROMPT = <<~PROMPT
   - **Project conventions** – anything mandated by CLAUDE.md or referenced skill files
   - **Test coverage** – missing or inadequate tests for the changes
 
-  %<pipeline_section>s## Output format
+  %<pipeline_section>s%<issue_section>s## Output format
 
   Respond with **only** a valid JSON object. No markdown fences, no preamble, no explanation.
 
@@ -629,10 +717,12 @@ def review_json_schema(language)
 end
 
 def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:, repo_path:,
-                      language: "French", pipeline_section: "", pipeline_step: "")
+                      language: "French", pipeline_section: "", pipeline_step: "",
+                      issue_section: "")
   prompt = format(REVIEW_PROMPT, target: target_branch, review_branch: review_branch,
                                  language: language,
-                                 pipeline_section: pipeline_section, pipeline_step: pipeline_step)
+                                 pipeline_section: pipeline_section, pipeline_step: pipeline_step,
+                                 issue_section: issue_section)
 
   raw_output = nil
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -706,7 +796,7 @@ CONSOLIDATION_PROMPT = <<~PROMPT
   - **Severity review**: Verify that the severity assigned to each kept comment is appropriate.
     Adjust if needed (e.g. a "warning" that is actually a nitpick should be downgraded).
 
-  ## Raw comments from %<pass_count>d review passes
+  %<issue_section>s## Raw comments from %<pass_count>d review passes
 
   ```json
   %<raw_comments_json>s
@@ -746,7 +836,7 @@ PROMPT
 
 def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_count:,
                              claude_bin:, claude_timeout:, repo_path:, language: "French",
-                             pipeline_summaries: [])
+                             pipeline_summaries: [], issue_section: "")
   best_pipeline_summary = pipeline_summaries.compact.reject(&:empty?).max_by(&:length)
 
   # Tag each comment with its pass number for traceability in the prompt
@@ -755,7 +845,8 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
   prompt = format(CONSOLIDATION_PROMPT,
                   target: target_branch, review_branch: review_branch,
                   pass_count: pass_count, language: language,
-                  raw_comments_json: JSON.pretty_generate(tagged))
+                  raw_comments_json: JSON.pretty_generate(tagged),
+                  issue_section: issue_section)
 
   raw_output = nil
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
@@ -1148,6 +1239,48 @@ def main
     end
   end
 
+  # 2b. Resolve MR from issue URL if no explicit MR was given
+  issue_section = ""
+  if args[:issue_url]
+    if mr_iid.nil?
+      current_phase = "find_mr_from_issue"
+      puts pastel.dim("  Looking up MRs related to issue ##{args[:issue_iid]} in #{project}…")
+      mrs = IssueContext.related_mrs(args[:base_url], project, args[:issue_iid], token)
+      raise MrReviewError, "No related MRs found for issue #{args[:issue_url]}" if mrs.empty?
+
+      selected = if mrs.size == 1
+        mrs.first
+      elsif config["headless"]
+        list = mrs.map { |m| "    • !#{m["iid"]} #{m["title"]} (#{m["state"]}) — #{m["web_url"]}" }.join("\n")
+        raise MrReviewError,
+              "Multiple MRs (#{mrs.size}) related to this issue. " \
+              "In headless mode, pass the MR URL as a second argument:\n#{list}"
+      else
+        choices = mrs.map { |m| { name: "!#{m["iid"]} #{m["title"]} (#{m["state"]})", value: m } }
+        tty.select("Select MR to review:", choices, cycle: true, per_page: 10)
+      end
+
+      mr_url_parsed = GitLabUrl.parse(selected["web_url"])
+      raise MrReviewError, "Could not parse MR web_url: #{selected["web_url"]}" unless mr_url_parsed
+
+      args[:base_url] = mr_url_parsed[:base_url]
+      project         = mr_url_parsed[:project_path]
+      args[:project_path] = project
+      mr_iid          = mr_url_parsed[:iid]
+      args[:mr_iid]   = mr_iid
+      puts pastel.green("  ✓ Selected MR !#{mr_iid} in #{project}")
+    end
+
+    # Fetch issue markdown via issue-md and inject as context
+    current_phase = "fetch_issue"
+    puts pastel.dim("  Fetching issue context via #{config["issue_md_bin"]}…")
+    issue_md = IssueContext.fetch_markdown(args[:issue_url], config["issue_md_bin"], token)
+    issue_section = "## Issue context\n\nThe MR addresses the following issue. " \
+                    "Use this to understand the business intent and judge whether the changes match it.\n\n" \
+                    "#{issue_md}\n\n"
+    puts pastel.green("  ✓ Issue context loaded (#{issue_md.length} chars)")
+  end
+
   # 3. Fetch MR metadata
   current_phase = "fetch_mr"
   puts "  Fetching MR !#{mr_iid} from #{project}…"
@@ -1308,7 +1441,8 @@ def main
                                  claude_bin: claude_bin, claude_timeout: claude_timeout,
                                  repo_path: repo_mgr.repo_path, language: language,
                                  pipeline_section: pf.prompt_section,
-                                 pipeline_step: pf.prompt_step)
+                                 pipeline_step: pf.prompt_step,
+                                 issue_section: issue_section)
       pass_review = result["review"]
       total_duration += result["duration"]
       pass_verdicts << pass_review["verdict"]
@@ -1328,7 +1462,8 @@ def main
       pass_count: review_passes,
       claude_bin: claude_bin, claude_timeout: claude_timeout,
       repo_path: repo_mgr.repo_path, language: language,
-      pipeline_summaries: pipeline_summaries
+      pipeline_summaries: pipeline_summaries,
+      issue_section: issue_section
     )
     review   = consolidation["review"]
     total_duration += consolidation["duration"]

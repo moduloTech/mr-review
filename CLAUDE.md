@@ -15,6 +15,13 @@ A single-file Ruby CLI tool (`bin/mr-review`) distributed via Homebrew (`modulot
 # Review by project path + MR IID
 ./bin/mr-review modulosource/ff/fast/core 687
 
+# Review by issue URL — picks the related MR (prompt if multiple) and uses the
+# issue as context in the Claude prompt
+./bin/mr-review https://source.modulotech.fr/modulosource/ff/fast/core/-/issues/123
+
+# Issue + explicit MR (required form for headless when several MRs are related)
+./bin/mr-review <ISSUE_URL> <MR_URL>
+
 # With explicit database path
 ./bin/mr-review -d sqlite://path/to/reviews.db <MR_URL>
 
@@ -22,16 +29,16 @@ A single-file Ruby CLI tool (`bin/mr-review`) distributed via Homebrew (`modulot
 ./bin/mr-review -t glpat-xxxx <MR_URL>
 ```
 
-Dependencies are installed automatically via `bundler/inline` (no separate `bundle install` needed). Requires Ruby and the `claude` CLI on PATH.
+Dependencies are installed automatically via `bundler/inline` (no separate `bundle install` needed). Requires Ruby and the `claude` CLI on PATH. The `issue-md` CLI (sibling tool) is required only when an issue URL is provided.
 
 ## Configuration
 
 Settings are resolved in 4 layers (highest priority wins):
 
-1. **Defaults** — `claude_bin: "claude"`, `claude_timeout: 360`
+1. **Defaults** — `claude_bin: "claude"`, `claude_timeout: 360`, `issue_md_bin: "issue-md"`
 2. **Config file** — `~/.mr-review/config.yml`
-3. **Environment variables** — `GITLAB_API_TOKEN`, `DATABASE_URL`, `CLAUDE_BIN`, `CLAUDE_TIMEOUT`
-4. **CLI flags** — `-d`/`--database-url`, `-t`/`--token`, `--claude-bin`, `--claude-timeout`
+3. **Environment variables** — `GITLAB_API_TOKEN`, `DATABASE_URL`, `CLAUDE_BIN`, `CLAUDE_TIMEOUT`, `ISSUE_MD_BIN`
+4. **CLI flags** — `-d`/`--database-url`, `-t`/`--token`, `--claude-bin`, `--claude-timeout`, `--issue-md`
 
 ### Config file example (`~/.mr-review/config.yml`)
 
@@ -50,6 +57,7 @@ claude_timeout: 360
 - `--claude-timeout SECONDS` — Review timeout in seconds
 - `-H` / `--headless` — Skip interactive validation and submit all comments directly
 - `-l` / `--language LANG` — Review language (default: French)
+- `--issue-md PATH` — Path to issue-md binary (default: `issue-md`)
 - `-v` / `--version` — Show version and exit
 - `-h` / `--help` — Show help
 
@@ -57,8 +65,9 @@ claude_timeout: 360
 
 The script follows a linear pipeline in the `main` method:
 
-1. **Argument parsing** (`parse_args` + `Config.load`) — OptionParser for flags, positional args for MR URL or `<project_path> <mr_iid>`
+1. **Argument parsing** (`parse_args` + `Config.load`) — OptionParser for flags, positional args for MR URL, `<project_path> <mr_iid>`, an issue/work_item URL, or `<ISSUE_URL> <MR_URL>`. URL classification is done by `GitLabUrl.parse`.
 2. **Database connection** (`Database.connect`) — optional, graceful degradation if unavailable
+2b. **Issue context** (when an issue URL was given) — `IssueContext.related_mrs` lists MRs related to the issue. With one MR, it's selected automatically; with several, the user picks (or, in `--headless`, mr-review aborts and asks for `<MR_URL>` as a second argument). Then `IssueContext.fetch_markdown` shells out to `issue-md` to render the issue, and the result is injected into the Claude review and consolidation prompts as `## Issue context`.
 3. **Fetch MR metadata** — GitLab API call
 4. **INSERT review** — DB row with `status: pending`
 5. **Idempotence check** — DB `last_reviewed_sha` first, GitLab notes fallback
