@@ -783,7 +783,9 @@ def invoke_claude_cli(cmd, repo_path:, claude_timeout:, label:)
       Timeout.timeout(claude_timeout) do
         Tempfile.create(["claude_#{label}", ".txt"]) do |f|
           f.close
-          system("#{cmd} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
+          Bundler.with_unbundled_env do
+            system("#{cmd} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
+          end
           status     = $CHILD_STATUS
           raw_output = File.read(f.path)
 
