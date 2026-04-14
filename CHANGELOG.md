@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-04-14
+
 ### Fixed
 
 - `claude -p` shellout now wrapped in `Bundler.with_unbundled_env` to clear inherited `BUNDLE_*` variables. This prevented using `danger-claude` (or any Ruby-based wrapper) as `claude_bin`, since the polluted Bundler environment could interfere with the child process. Same fix previously applied to the `issue-md` shellout in v0.3.1.
