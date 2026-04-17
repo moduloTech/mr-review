@@ -2,10 +2,13 @@
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-04-17
+
 ### Fixed
 
 - Separated stderr from stdout when capturing `claude -p` output — `2>&1` was mixing progress/status messages from stderr into the JSON envelope, causing `ClaudeParseError` on every review pass.
 - Added `parse_claude_envelope` helper with fallback JSON extraction: if the raw output contains non-JSON preamble, the parser now locates and extracts the outermost `{…}` object instead of failing immediately.
+- Handle `structured_output` as JSON string in addition to Hash, and retry automatically when Claude ignores `--json-schema` and returns plain text instead of structured JSON.
 
 ## [0.3.3] - 2026-04-14
 

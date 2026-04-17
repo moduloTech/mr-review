@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 # =============================================================================
 # mr-review
@@ -792,6 +792,65 @@ rescue JSON::ParserError
   JSON.parse(raw_output[start_idx..end_idx])
 end
 
+# Extract the review Hash from a Claude CLI JSON envelope.
+# Handles structured_output (Hash or JSON string) and result (JSON string).
+# Raises ClaudeParseError when the envelope contains no usable review data.
+def extract_review_from_envelope(envelope)
+  raise ClaudeParseError, "Envelope is not a Hash: #{envelope.class}" unless envelope.is_a?(Hash)
+
+  try_structured_output(envelope) || try_result_field(envelope) ||
+    (raise ClaudeParseError, "Unexpected envelope structure: #{envelope.keys.inspect}")
+end
+
+def try_structured_output(envelope)
+  so = envelope['structured_output']
+  return so if so.is_a?(Hash)
+  return unless so.is_a?(String)
+
+  parsed = JSON.parse(so)
+  parsed if parsed.is_a?(Hash)
+rescue JSON::ParserError
+  nil
+end
+
+def try_result_field(envelope)
+  result = envelope['result']
+  return unless result.is_a?(String) && !result.empty?
+
+  parsed = JSON.parse(result)
+  parsed if parsed.is_a?(Hash)
+end
+
+# Invoke Claude CLI and extract a review Hash from the JSON envelope.
+# Retries up to CLAUDE_MAX_ATTEMPTS when Claude returns a valid envelope but
+# the result is plain text instead of structured JSON (schema not respected).
+EXTRACT_MAX_ATTEMPTS = 2
+EXTRACT_RETRY_BACKOFF_SEC = 30
+
+def invoke_and_extract(cmd, repo_path:, claude_timeout:, label:)
+  raw_output = nil
+  attempt = 0
+
+  loop do
+    attempt += 1
+    t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    raw_output = invoke_claude_cli(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: label)
+    duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
+
+    envelope = parse_claude_envelope(raw_output)
+    review = extract_review_from_envelope(envelope)
+    return { 'review' => review, 'duration' => duration.round(1) }
+  rescue ClaudeParseError => e
+    raise e if attempt >= EXTRACT_MAX_ATTEMPTS
+
+    warn "    ⚠ #{label} returned non-JSON result (attempt #{attempt}/#{EXTRACT_MAX_ATTEMPTS}); " \
+         "retrying in #{EXTRACT_RETRY_BACKOFF_SEC}s…"
+    sleep(EXTRACT_RETRY_BACKOFF_SEC)
+  end
+rescue JSON::ParserError => e
+  raise ClaudeParseError, "#{label.capitalize} returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
+end
+
 def claude_retryable_failure?(raw_output)
   return true if raw_output.nil? || raw_output.strip.empty?
 
@@ -884,31 +943,10 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
                                  pipeline_section: pipeline_section, pipeline_step: pipeline_step,
                                  issue_section: issue_section)
 
-  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
   cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json}"
 
-  # Write output to a temp file to avoid pipe buffer truncation on large reviews.
-  raw_output = invoke_claude_cli(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: "review")
-
-  duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
-
-  # With --output-format json + --json-schema, Claude wraps the result in a JSON envelope.
-  # The structured output lives in "structured_output", not "result".
-  envelope = parse_claude_envelope(raw_output)
-
-  review = if envelope.is_a?(Hash) && envelope["structured_output"].is_a?(Hash)
-    envelope["structured_output"]
-  elsif envelope.is_a?(Hash) && envelope["result"].is_a?(String) && !envelope["result"].empty?
-    JSON.parse(envelope["result"])
-  else
-    raise ClaudeParseError, "Unexpected envelope structure: #{envelope.keys.inspect}"
-  end
-
-  { "review" => review, "duration" => duration.round(1) }
-rescue JSON::ParserError => e
-  raise ClaudeParseError, "Claude returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
+  invoke_and_extract(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: 'review')
 end
 
 # ── Multi-pass consolidation ─────────────────────────────────────────────────
@@ -997,31 +1035,15 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
                   raw_comments_json: JSON.pretty_generate(tagged),
                   issue_section: issue_section)
 
-  t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
   cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json}"
 
-  raw_output = invoke_claude_cli(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: "consolidation")
-
-  duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
-
-  envelope = parse_claude_envelope(raw_output)
-
-  review = if envelope.is_a?(Hash) && envelope["structured_output"].is_a?(Hash)
-    envelope["structured_output"]
-  elsif envelope.is_a?(Hash) && envelope["result"].is_a?(String) && !envelope["result"].empty?
-    JSON.parse(envelope["result"])
-  else
-    raise ClaudeParseError, "Unexpected envelope structure (consolidation): #{envelope.keys.inspect}"
-  end
+  result = invoke_and_extract(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: 'consolidation')
 
   # Inject the best pipeline_summary if consolidation didn't produce one
-  review["pipeline_summary"] ||= best_pipeline_summary
+  result['review']['pipeline_summary'] ||= best_pipeline_summary
 
-  { "review" => review, "duration" => duration.round(1) }
-rescue JSON::ParserError => e
-  raise ClaudeParseError, "Consolidation returned invalid JSON: #{e.message}\n\nRaw output:\n#{raw_output&.[](0, 1000)}"
+  result
 end
 
 # ── Interactive comment validator ─────────────────────────────────────────────
