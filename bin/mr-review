@@ -746,6 +746,52 @@ CLAUDE_RETRYABLE_PATTERNS = [
   /Bad Gateway/i
 ].freeze
 
+# Extract and parse the JSON envelope from Claude CLI output.
+# Tries a direct parse first; if that fails, looks for the outermost `{…}` object.
+def parse_claude_envelope(raw_output)
+  JSON.parse(raw_output)
+rescue JSON::ParserError
+  # The output may contain non-JSON preamble (e.g. stray stderr leaking into stdout).
+  # Try extracting the first top-level JSON object.
+  start_idx = raw_output.index("{")
+  raise unless start_idx # re-raise original error if no `{` found
+
+  depth = 0
+  in_string = false
+  escape_next = false
+  end_idx = nil
+
+  (start_idx...raw_output.length).each do |i|
+    ch = raw_output[i]
+    if escape_next
+      escape_next = false
+      next
+    end
+    if in_string
+      if ch == "\\"
+        escape_next = true
+      elsif ch == '"'
+        in_string = false
+      end
+    else
+      case ch
+      when '"' then in_string = true
+      when "{" then depth += 1
+      when "}"
+        depth -= 1
+        if depth.zero?
+          end_idx = i
+          break
+        end
+      end
+    end
+  end
+
+  raise unless end_idx # re-raise if no matching `}` found
+
+  JSON.parse(raw_output[start_idx..end_idx])
+end
+
 def claude_retryable_failure?(raw_output)
   return true if raw_output.nil? || raw_output.strip.empty?
 
@@ -781,21 +827,32 @@ def invoke_claude_cli(cmd, repo_path:, claude_timeout:, label:)
     begin
       raw_output = nil
       Timeout.timeout(claude_timeout) do
-        Tempfile.create(["claude_#{label}", ".txt"]) do |f|
-          f.close
+        out_file = Tempfile.create(["claude_#{label}", ".txt"])
+        err_file = Tempfile.create(["claude_#{label}_err", ".txt"])
+        begin
+          out_file.close
+          err_file.close
           Bundler.with_unbundled_env do
-            system("#{cmd} > #{Shellwords.escape(f.path)} 2>&1", chdir: repo_path)
+            system("#{cmd} > #{Shellwords.escape(out_file.path)} 2>#{Shellwords.escape(err_file.path)}",
+                   chdir: repo_path)
           end
           status     = $CHILD_STATUS
-          raw_output = File.read(f.path)
+          raw_output = File.read(out_file.path)
+          stderr_out = File.read(err_file.path)
 
           unless status.success?
-            if claude_retryable_failure?(raw_output)
-              raise ClaudeRetryableError, claude_failure_snippet(raw_output)
+            combined = "#{raw_output}\n#{stderr_out}".strip
+            if claude_retryable_failure?(combined)
+              raise ClaudeRetryableError, claude_failure_snippet(combined)
             end
             raise ClaudeError,
-                  "claude -p (#{label}) exited with status #{status.exitstatus}\n#{raw_output[0, 500]}"
+                  "claude -p (#{label}) exited with status #{status.exitstatus}\n#{combined[0, 500]}"
           end
+        ensure
+          out_file.close unless out_file.closed?
+          err_file.close unless err_file.closed?
+          File.unlink(out_file.path) if File.exist?(out_file.path)
+          File.unlink(err_file.path) if File.exist?(err_file.path)
         end
       end
       return raw_output
@@ -839,7 +896,7 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
 
   # With --output-format json + --json-schema, Claude wraps the result in a JSON envelope.
   # The structured output lives in "structured_output", not "result".
-  envelope = JSON.parse(raw_output)
+  envelope = parse_claude_envelope(raw_output)
 
   review = if envelope.is_a?(Hash) && envelope["structured_output"].is_a?(Hash)
     envelope["structured_output"]
@@ -949,7 +1006,7 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
 
   duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
 
-  envelope = JSON.parse(raw_output)
+  envelope = parse_claude_envelope(raw_output)
 
   review = if envelope.is_a?(Hash) && envelope["structured_output"].is_a?(Hash)
     envelope["structured_output"]
