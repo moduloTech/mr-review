@@ -675,7 +675,7 @@ REVIEW_PROMPT = <<~PROMPT
         "file": "<relative file path from repo root>",
         "line": <integer — line number in the NEW version of the file>,
         "severity": "error" | "warning" | "info" | "nitpick",
-        "category": "bug" | "security" | "logic" | "performance" | "style" | "test" | "other",
+        "category": "bug" | "security" | "logic" | "performance" | "style" | "test" | "spec" | "other",
         "body": "<markdown comment>"
       }
     ]
@@ -715,7 +715,7 @@ def review_json_schema(language)
             file:     { type: "string", description: "Relative file path from repo root" },
             line:     { type: "integer", description: "Line number in the NEW version of the file" },
             severity: { type: "string", enum: %w[error warning info nitpick] },
-            category: { type: "string", enum: %w[bug security logic performance style test other] },
+            category: { type: "string", enum: %w[bug security logic performance style test spec other] },
             body:     { type: "string", description: "Markdown comment in #{language}" }
           }
         }
@@ -1013,7 +1013,7 @@ CONSOLIDATION_PROMPT = <<~PROMPT
         "file": "<relative file path from repo root>",
         "line": <integer — line number in the NEW version of the file>,
         "severity": "error" | "warning" | "info" | "nitpick",
-        "category": "bug" | "security" | "logic" | "performance" | "style" | "test" | "other",
+        "category": "bug" | "security" | "logic" | "performance" | "style" | "test" | "spec" | "other",
         "body": "<markdown comment>"
       }
     ]
@@ -1446,8 +1446,14 @@ def main
     current_phase = "fetch_issue"
     puts pastel.dim("  Fetching issue context via #{config["issue_md_bin"]}…")
     issue_md = IssueContext.fetch_markdown(args[:issue_url], config["issue_md_bin"], token)
-    issue_section = "## Issue context\n\nThe MR addresses the following issue. " \
-                    "Use this to understand the business intent and judge whether the changes match it.\n\n" \
+    issue_section = "## Issue context\n\n" \
+                    "The MR addresses the following issue. Use this both to understand the business " \
+                    "intent and to **verify the implementation matches the specification**.\n\n" \
+                    "When you spot a mismatch — a requirement that is missing, a behaviour that " \
+                    "diverges from what's specified, scope creep that wasn't asked for, or a feature " \
+                    "stub that doesn't fulfil the spec — emit a comment with `category: \"spec\"` " \
+                    "anchored at the closest representative diff line (or the file most likely to " \
+                    "contain the missing logic).\n\n" \
                     "#{issue_md}\n\n"
     puts pastel.green("  ✓ Issue context loaded (#{issue_md.length} chars)")
   end

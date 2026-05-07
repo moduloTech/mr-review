@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Implementation/specification coherence check, active only when an issue URL is provided. The injected `## Issue context` section now explicitly asks Claude to verify the MR matches the spec and to emit `category: "spec"` comments for missing requirements, divergences, scope creep, or feature stubs. Added `spec` to the `category` enum (schema + review/consolidation prompts).
+
 ### Changed
 
 - Removed the `--max-turns 30` cap on `claude -p` invocations (review and consolidation). Large MRs were hitting the limit and failing all retries with `error_max_turns` (which is deterministic and not actually transient).
