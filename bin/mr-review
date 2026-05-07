@@ -643,12 +643,14 @@ REVIEW_PROMPT = <<~PROMPT
 
   ## Steps
 
-  1. Run `git diff origin/%<target>s...HEAD --stat` to list changed files.
-  2. Run `git diff origin/%<target>s...HEAD` to read the full diff.
-  3. For each changed file, read its full content when context beyond the diff is needed.
-  4. Read `CLAUDE.md` (if it exists) and any referenced skill or convention files.
-  5. Check the MR commit messages (`git log origin/%<target>s..HEAD --oneline`) for context
-     and for whether previous review comments (if any) have been addressed.%<pipeline_step>s
+  1. Read the full diff with `git diff origin/%<target>s...HEAD`.
+  2. Read `CLAUDE.md` at the repo root if it exists, for project conventions.
+  3. **Only when the diff alone is insufficient** to judge a specific concern (e.g. you need to
+     see how a function is called or the surrounding class structure), read the relevant file
+     or referenced skill file. Do not pre-emptively read every changed file — each `Read` should
+     answer a concrete question you have about the diff.
+  4. Use `git log origin/%<target>s..HEAD --oneline` only if commit history is needed to judge
+     the changes (e.g. to verify previous review comments were addressed).%<pipeline_step>s
 
   ## Review criteria (in priority order)
 
@@ -745,6 +747,11 @@ CLAUDE_RETRYABLE_PATTERNS = [
   /Service Unavailable/i,
   /Bad Gateway/i
 ].freeze
+
+# Envelope subtypes that represent deterministic terminations — never retry.
+# `error_max_turns` is hit when the agent runs out of turns; retrying with the
+# same prompt+budget will deterministically fail again.
+CLAUDE_NON_RETRYABLE_SUBTYPES = %w[error_max_turns].freeze
 
 # Extract and parse the JSON envelope from Claude CLI output.
 # Tries a direct parse first; if that fails, looks for the outermost `{…}` object.
@@ -854,8 +861,12 @@ end
 def claude_retryable_failure?(raw_output)
   return true if raw_output.nil? || raw_output.strip.empty?
 
-  envelope = JSON.parse(raw_output)
+  envelope = parse_claude_envelope(raw_output)
   return false unless envelope.is_a?(Hash) && envelope["is_error"]
+
+  # Deterministic terminations (e.g. error_max_turns) — surface the failure
+  # immediately instead of burning retries on something that won't change.
+  return false if CLAUDE_NON_RETRYABLE_SUBTYPES.include?(envelope["subtype"])
 
   result = envelope["result"].to_s
   CLAUDE_RETRYABLE_PATTERNS.any? { |pat| result.match?(pat) }
@@ -944,7 +955,7 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
                                  issue_section: issue_section)
 
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
-  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json}"
+  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --output-format json --json-schema #{schema_json}"
 
   invoke_and_extract(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: 'review')
 end
@@ -1036,7 +1047,7 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
                   issue_section: issue_section)
 
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
-  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --max-turns 30 --output-format json --json-schema #{schema_json}"
+  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --output-format json --json-schema #{schema_json}"
 
   result = invoke_and_extract(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: 'consolidation')
 

@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Changed
+
+- Removed the `--max-turns 30` cap on `claude -p` invocations (review and consolidation). Large MRs were hitting the limit and failing all retries with `error_max_turns` (which is deterministic and not actually transient).
+- Lightened the review prompt: Claude no longer reads every changed file pre-emptively. The new guidance asks for selective `Read`s only when the diff alone is insufficient, reducing tool-call count on large MRs.
+
+### Fixed
+
+- Retry classification now treats deterministic envelope terminations (`error_max_turns`) as non-retryable. Previously these burned all 3 attempts with 30s + 90s backoff for nothing. The check also uses the robust `parse_claude_envelope` so stderr noise concatenated to stdout no longer falls through to "retry on JSON parse error".
+
 ## [0.3.4] - 2026-04-17
 
 ### Fixed
