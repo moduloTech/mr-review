@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-VERSION = "0.3.4"
+VERSION = "0.4.0"
 
 # =============================================================================
 # mr-review

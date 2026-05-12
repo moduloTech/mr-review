@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-12
+
 ### Added
 
 - Implementation/specification coherence check, active only when an issue URL is provided. The injected `## Issue context` section now explicitly asks Claude to verify the MR matches the spec and to emit `category: "spec"` comments for missing requirements, divergences, scope creep, or feature stubs. Added `spec` to the `category` enum (schema + review/consolidation prompts).
