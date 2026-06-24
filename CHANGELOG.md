@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-06-24
+
+### Fixed
+
+- Prompt is now piped to `claude -p` via stdin instead of being passed as the `-p <prompt>` command-line argument. Large issue contexts (e.g. 158 KB) exceeded the kernel's single-argument limit (`MAX_ARG_STRLEN`, 128 KB), making `exec` fail with `argument list too long` (E2BIG). The failure was misclassified as a transient API error and burned all retries. (Pairs with the danger-claude v0.5.10 fix when `claude_bin` is `danger-claude`.)
+
 ## [0.4.0] - 2026-05-12
 
 ### Added

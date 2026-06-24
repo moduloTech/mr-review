@@ -1,7 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 # =============================================================================
 # mr-review
@@ -834,14 +834,15 @@ end
 EXTRACT_MAX_ATTEMPTS = 2
 EXTRACT_RETRY_BACKOFF_SEC = 30
 
-def invoke_and_extract(cmd, repo_path:, claude_timeout:, label:)
+def invoke_and_extract(cmd, prompt:, repo_path:, claude_timeout:, label:)
   raw_output = nil
   attempt = 0
 
   loop do
     attempt += 1
     t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-    raw_output = invoke_claude_cli(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: label)
+    raw_output = invoke_claude_cli(cmd, prompt: prompt, repo_path: repo_path,
+                                        claude_timeout: claude_timeout, label: label)
     duration = Process.clock_gettime(Process::CLOCK_MONOTONIC) - t0
 
     envelope = parse_claude_envelope(raw_output)
@@ -888,7 +889,7 @@ rescue JSON::ParserError
   raw_output[0, 200]
 end
 
-def invoke_claude_cli(cmd, repo_path:, claude_timeout:, label:)
+def invoke_claude_cli(cmd, prompt:, repo_path:, claude_timeout:, label:)
   attempt      = 0
   last_raised  = nil
 
@@ -897,13 +898,18 @@ def invoke_claude_cli(cmd, repo_path:, claude_timeout:, label:)
     begin
       raw_output = nil
       Timeout.timeout(claude_timeout) do
+        in_file  = Tempfile.create(["claude_#{label}_prompt", ".txt"])
         out_file = Tempfile.create(["claude_#{label}", ".txt"])
         err_file = Tempfile.create(["claude_#{label}_err", ".txt"])
         begin
+          in_file.write(prompt)
+          in_file.close
           out_file.close
           err_file.close
+          # Feed the prompt via stdin to avoid the kernel single-argument limit.
           Bundler.with_unbundled_env do
-            system("#{cmd} > #{Shellwords.escape(out_file.path)} 2>#{Shellwords.escape(err_file.path)}",
+            system("#{cmd} < #{Shellwords.escape(in_file.path)} " \
+                   "> #{Shellwords.escape(out_file.path)} 2>#{Shellwords.escape(err_file.path)}",
                    chdir: repo_path)
           end
           status     = $CHILD_STATUS
@@ -919,8 +925,10 @@ def invoke_claude_cli(cmd, repo_path:, claude_timeout:, label:)
                   "claude -p (#{label}) exited with status #{status.exitstatus}\n#{combined[0, 500]}"
           end
         ensure
+          in_file.close unless in_file.closed?
           out_file.close unless out_file.closed?
           err_file.close unless err_file.closed?
+          File.unlink(in_file.path) if File.exist?(in_file.path)
           File.unlink(out_file.path) if File.exist?(out_file.path)
           File.unlink(err_file.path) if File.exist?(err_file.path)
         end
@@ -955,9 +963,12 @@ def run_claude_review(target_branch, review_branch, claude_bin:, claude_timeout:
                                  issue_section: issue_section)
 
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
-  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --output-format json --json-schema #{schema_json}"
+  # The prompt is piped via stdin (not `-p <prompt>`): the issue context can be
+  # hundreds of KB, which busts the kernel's single-argument limit (MAX_ARG_STRLEN,
+  # 128 KB) and makes `exec` fail with "argument list too long" (E2BIG).
+  cmd = "#{claude_bin} -p --output-format json --json-schema #{schema_json}"
 
-  invoke_and_extract(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: 'review')
+  invoke_and_extract(cmd, prompt: prompt, repo_path: repo_path, claude_timeout: claude_timeout, label: 'review')
 end
 
 # ── Multi-pass consolidation ─────────────────────────────────────────────────
@@ -1047,9 +1058,10 @@ def run_claude_consolidation(raw_comments, target_branch:, review_branch:, pass_
                   issue_section: issue_section)
 
   schema_json = Shellwords.escape(JSON.generate(review_json_schema(language)))
-  cmd         = "#{claude_bin} -p #{Shellwords.escape(prompt)} --output-format json --json-schema #{schema_json}"
+  # Prompt piped via stdin — see run_claude_review for why (E2BIG on huge prompts).
+  cmd = "#{claude_bin} -p --output-format json --json-schema #{schema_json}"
 
-  result = invoke_and_extract(cmd, repo_path: repo_path, claude_timeout: claude_timeout, label: 'consolidation')
+  result = invoke_and_extract(cmd, prompt: prompt, repo_path: repo_path, claude_timeout: claude_timeout, label: 'consolidation')
 
   # Inject the best pipeline_summary if consolidation didn't produce one
   result['review']['pipeline_summary'] ||= best_pipeline_summary
